@@ -134,6 +134,14 @@ func (c *index) GenIndexKey(indexedValues []types.Datum, h int64) (key []byte, d
 	if distinct {
 		key, err = codec.EncodeKey(key, indexedValues...)
 	} else {
+		// case insensitive index
+		for i := 0; i < len(indexedValues); i++ {
+			v := &indexedValues[i]
+			if v.Kind() == types.KindBytes || v.Kind() == types.KindString {
+				lower := bytes.ToLower(v.GetBytes())
+				v.SetBytes(lower)
+			}
+		}
 		key, err = codec.EncodeKey(key, append(indexedValues, types.NewDatum(h))...)
 	}
 	if err != nil {
