@@ -68,6 +68,7 @@ type NewXSelectIndexExec struct {
 	indexPlan  *plan.PhysicalIndexScan
 
 	returnedRows uint64 // returned row count
+	closed       bool   // If the executor is closed.
 
 	mu sync.Mutex
 
@@ -120,6 +121,12 @@ func (e *NewXSelectIndexExec) Schema() expression.Schema {
 
 // Close implements Exec Close interface.
 func (e *NewXSelectIndexExec) Close() error {
+	if e.result != nil {
+		err := e.result.Close()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
 	e.result = nil
 	e.subResult = nil
 	e.taskCursor = 0
@@ -128,12 +135,13 @@ func (e *NewXSelectIndexExec) Close() error {
 	e.mu.Unlock()
 	e.indexOrder = make(map[int64]int)
 	e.returnedRows = 0
+	e.closed = true
 	return nil
 }
 
 // Next implements Executor Next interface.
 func (e *NewXSelectIndexExec) Next() (*Row, error) {
-	if e.indexPlan.LimitCount != nil && e.returnedRows >= uint64(*e.indexPlan.LimitCount) {
+	if e.closed || e.indexPlan.LimitCount != nil && e.returnedRows >= uint64(*e.indexPlan.LimitCount) {
 		return nil, nil
 	}
 	if e.tasks == nil {
@@ -415,6 +423,7 @@ type NewXSelectTableExec struct {
 	desc         bool
 	limitCount   *int64
 	returnedRows uint64 // returned rowCount
+	closed       bool   // If the executor is closed.
 
 	/*
 		The following attributes are used for aggregation push down.
@@ -481,15 +490,22 @@ func (e *NewXSelectTableExec) doRequest() error {
 
 // Close implements Executor Close interface.
 func (e *NewXSelectTableExec) Close() error {
+	if e.result != nil {
+		err := e.result.Close()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
 	e.result = nil
 	e.subResult = nil
 	e.returnedRows = 0
+	e.closed = true
 	return nil
 }
 
 // Next implements Executor interface.
 func (e *NewXSelectTableExec) Next() (*Row, error) {
-	if e.limitCount != nil && e.returnedRows >= uint64(*e.limitCount) {
+	if e.closed || e.limitCount != nil && e.returnedRows >= uint64(*e.limitCount) {
 		return nil, nil
 	}
 	if e.result == nil {
