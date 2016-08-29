@@ -745,6 +745,52 @@ func (e *XSelectIndexExec) indexRowToTableRow(handle int64, indexRow []types.Dat
 	return tableRow
 }
 
+// tableTaskWorkerPool implements workerPool interface.
+type tableTaskWorkerPool struct {
+	e           *XSelectIndexExec
+	ch          chan *lookupTableTask
+	concurrency int
+}
+
+func newTableTaskWorkerPool(e *XSelectIndexExec) *tableTaskWorkerPool {
+	worker := &tableTaskWorkerPool{
+		e:           e,
+		ch:          make(chan *lookupTableTask, 1),
+		concurrency: 0,
+	}
+	worker.AddWorker()
+	return worker
+}
+
+func (worker *tableTaskWorkerPool) Close() {
+	worker.e = nil
+	close(worker.ch)
+}
+
+func (worker *tableTaskWorkerPool) AddTask(task *lookupTableTask) {
+	select {
+	case worker.ch <- task:
+	default:
+		worker.AddWorker()
+		worker.ch <- task
+	}
+}
+
+const concurrencyLimit int = 30
+
+// AddWorker add a worker for lookupTableTask.
+// It's not thread-safe and should be called in fetchHandles goroutine only.
+func (worker *tableTaskWorkerPool) AddWorker() {
+	if worker.concurrency <= concurrencyLimit {
+		go worker.e.pickAndExecTask(worker.ch)
+		worker.concurrency = worker.concurrency + 1
+	}
+}
+
+func (worker *tableTaskWorkerPool) Concurrency() int {
+	return worker.concurrency
+}
+
 func (e *XSelectIndexExec) nextForDoubleRead() (*Row, error) {
 	var startTs time.Time
 	if e.tasks == nil {
@@ -759,7 +805,7 @@ func (e *XSelectIndexExec) nextForDoubleRead() (*Row, error) {
 		// e.tasks serves as a pipeline, so fetch index and get table data would
 		// run concurrency.
 		e.tasks = make(chan *lookupTableTask, 50)
-		go e.fetchHandles(idxResult, e.tasks)
+		go e.fetchHandles(idxResult, e.tasks, newTableTaskWorkerPool(e))
 	}
 
 	for {
@@ -780,25 +826,17 @@ func (e *XSelectIndexExec) nextForDoubleRead() (*Row, error) {
 	}
 }
 
-const concurrencyLimit int = 30
-
-// addWorker add a worker for lookupTableTask.
-// It's not thread-safe and should be called in fetchHandles goroutine only.
-func addWorker(e *XSelectIndexExec, ch chan *lookupTableTask, concurrency *int) {
-	if *concurrency <= concurrencyLimit {
-		go e.pickAndExecTask(ch)
-		*concurrency = *concurrency + 1
-	}
+// workerPool is a pool of workers to handle lookupTableTask on the background.
+type workerPool interface {
+	AddTask(*lookupTableTask)
+	AddWorker()
+	Concurrency() int // current worker count.
+	Close()
 }
 
-func (e *XSelectIndexExec) fetchHandles(idxResult xapi.SelectResult, ch chan<- *lookupTableTask) {
+func (e *XSelectIndexExec) fetchHandles(idxResult xapi.SelectResult, ch chan<- *lookupTableTask, workerPool workerPool) {
 	defer close(ch)
-
-	workCh := make(chan *lookupTableTask, 1)
-	defer close(workCh)
-
-	var concurrency int
-	addWorker(e, workCh, &concurrency)
+	defer workerPool.Close()
 
 	totalHandles := 0
 	startTs := time.Now()
@@ -809,23 +847,17 @@ func (e *XSelectIndexExec) fetchHandles(idxResult xapi.SelectResult, ch chan<- *
 			log.Debugf("[TIME_INDEX_SCAN] time: %v handles: %d concurrency: %d",
 				time.Now().Sub(startTs),
 				totalHandles,
-				concurrency)
+				workerPool.Concurrency())
 			return
 		}
 
 		totalHandles += len(handles)
 		tasks := e.buildTableTasks(handles)
 		for _, task := range tasks {
-			if concurrency < len(tasks) {
-				addWorker(e, workCh, &concurrency)
+			if workerPool.Concurrency() < len(tasks) {
+				workerPool.AddWorker()
 			}
-
-			select {
-			case workCh <- task:
-			default:
-				addWorker(e, workCh, &concurrency)
-				workCh <- task
-			}
+			workerPool.AddTask(task)
 			ch <- task
 		}
 	}
