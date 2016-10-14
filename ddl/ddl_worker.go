@@ -416,6 +416,11 @@ func (d *ddl) runDDLJob(t *meta.Meta, job *model.Job) {
 		err = d.onDropColumn(t, job)
 	case model.ActionAddIndex:
 		err = d.onCreateIndex(t, job)
+		if job.SchemaState == model.StateWriteReorganization &&
+			terror.ErrorEqual(err, kv.ErrKeyExists) {
+			job.State = model.JobCancelled
+			log.Warnf("[ddl] run DDL job %v err %v, update job state to cancelled", job, err)
+		}
 	case model.ActionDropIndex:
 		err = d.onDropIndex(t, job)
 	case model.ActionAddForeignKey:
