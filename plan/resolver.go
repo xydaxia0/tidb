@@ -22,8 +22,6 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/db"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/types"
 )
@@ -31,7 +29,7 @@ import (
 // ResolveName resolves table name and column name.
 // It generates ResultFields for ResultSetNode and resolves ColumnNameExpr to a ResultField.
 func ResolveName(node ast.Node, info infoschema.InfoSchema, ctx context.Context) error {
-	defaultSchema := db.GetCurrentSchema(ctx)
+	defaultSchema := ctx.GetSessionVars().CurrentDB
 	resolver := nameResolver{Info: info, Ctx: ctx, DefaultSchema: model.NewCIStr(defaultSchema)}
 	node.Accept(&resolver)
 	return errors.Trace(resolver.Err)
@@ -367,9 +365,9 @@ func (nr *nameResolver) handleTableName(tn *ast.TableName) {
 		ast.ValueExpr
 		ast.ResultField
 	}, len(tn.TableInfo.Columns))
-	sVars := variable.GetSessionVars(nr.Ctx)
+	status := nr.Ctx.GetSessionVars().StmtCtx
 	for i, v := range tn.TableInfo.Columns {
-		if sVars.InUpdateStmt {
+		if status.InUpdateStmt {
 			switch v.State {
 			case model.StatePublic, model.StateWriteOnly, model.StateWriteReorganization:
 			default:
@@ -723,7 +721,7 @@ func (nr *nameResolver) createResultFields(field *ast.SelectField) (rfs []*ast.R
 	ctx := nr.currentContext()
 	if field.WildCard != nil {
 		if len(ctx.tables) == 0 {
-			nr.Err = errors.New("No table used.")
+			nr.Err = errors.New("no table used")
 			return
 		}
 		tableRfs := []*ast.ResultField{}
@@ -911,6 +909,8 @@ func (nr *nameResolver) fillShowFields(s *ast.ShowStmt) {
 			mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeLonglong}
 	case ast.ShowCreateTable:
 		names = []string{"Table", "Create Table"}
+	case ast.ShowCreateDatabase:
+		names = []string{"Database", "Create Database"}
 	case ast.ShowGrants:
 		names = []string{fmt.Sprintf("Grants for %s", s.User)}
 	case ast.ShowTriggers:
@@ -918,7 +918,7 @@ func (nr *nameResolver) fillShowFields(s *ast.ShowStmt) {
 			"sql_mode", "Definer", "character_set_client", "collation_connection", "Database Collation"}
 		ftypes = []byte{mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar,
 			mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar}
-	case ast.ShowProcedureStatus:
+	case ast.ShowProcedureStatus, ast.ShowEvents:
 		names = []string{}
 		ftypes = []byte{}
 	case ast.ShowIndex:
@@ -928,6 +928,10 @@ func (nr *nameResolver) fillShowFields(s *ast.ShowStmt) {
 		ftypes = []byte{mysql.TypeVarchar, mysql.TypeLonglong, mysql.TypeVarchar, mysql.TypeLonglong,
 			mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeLonglong, mysql.TypeLonglong,
 			mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeVarchar}
+	case ast.ShowProcessList:
+		names = []string{"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}
+		ftypes = []byte{mysql.TypeLonglong, mysql.TypeVarchar, mysql.TypeVarchar,
+			mysql.TypeVarchar, mysql.TypeVarchar, mysql.TypeLong, mysql.TypeVarchar, mysql.TypeString}
 	}
 	for i, name := range names {
 		f := &ast.ResultField{

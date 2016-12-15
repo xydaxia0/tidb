@@ -21,7 +21,6 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/sessionctx/variable"
 )
 
 // recordSet wraps an executor, implements ast.RecordSet interface
@@ -61,7 +60,9 @@ func (a *recordSet) Close() error {
 	return a.executor.Close()
 }
 
+// statement implements the ast.Statement interface, it builds a plan.Plan to an ast.Statement.
 type statement struct {
+	// The InfoSchema cannot change during execution, so we hold a reference to it.
 	is    infoschema.InfoSchema
 	plan  plan.Plan
 	text  string
@@ -81,6 +82,10 @@ func (a *statement) IsDDL() bool {
 	return a.isDDL
 }
 
+// Exec implements the ast.Statement Exec interface.
+// This function builds an Executor from a plan. If the Executor doesn't return result,
+// like the INSERT, UPDATE statements, it executes in this function, if the Executor returns
+// result, execution is done after this function returns, in the returned ast.RecordSet Next method.
 func (a *statement) Exec(ctx context.Context) (ast.RecordSet, error) {
 	b := newExecutorBuilder(ctx, a.is)
 	e := b.build(a.plan)
@@ -88,47 +93,46 @@ func (a *statement) Exec(ctx context.Context) (ast.RecordSet, error) {
 		return nil, errors.Trace(b.err)
 	}
 
+	// ExecuteExec is not a real Executor, we only use it to build another Executor from a prepared statement.
 	if executorExec, ok := e.(*ExecuteExec); ok {
 		err := executorExec.Build()
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+		stmtCount(executorExec.Stmt)
 		e = executorExec.StmtExec
 	}
 
-	if len(e.Fields()) == 0 && len(e.Schema()) == 0 {
-		// Write statements do not have record set, check if snapshot ts is set.
+	// Fields or Schema are only used for statements that return result set.
+	if len(e.Schema()) == 0 {
+		// Check if "tidb_snapshot" is set for the write executors.
+		// In history read mode, we can not do write operations.
 		switch e.(type) {
 		case *DeleteExec, *InsertExec, *UpdateExec, *ReplaceExec, *LoadData, *DDLExec:
-			snapshotTS := variable.GetSnapshotTS(ctx)
+			snapshotTS := ctx.GetSessionVars().SnapshotTS
 			if snapshotTS != 0 {
-				return nil, errors.New("Can not execute write statement when 'tidb_snapshot' is set.")
+				return nil, errors.New("can not execute write statement when 'tidb_snapshot' is set")
 			}
 		}
 
-		// No result fields means no Recordset.
 		defer e.Close()
 		for {
 			row, err := e.Next()
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
+			// Even though there isn't any result set, the row is still used to indicate if there is
+			// more work to do.
+			// For example, the UPDATE statement updates a single row on a Next call, we keep calling Next until
+			// There is no more rows to update.
 			if row == nil {
 				return nil, nil
 			}
 		}
 	}
 
-	fs := e.Fields()
-	for _, f := range fs {
-		if len(f.ColumnAsName.O) == 0 {
-			f.ColumnAsName = f.Column.Name
-		}
-	}
-
 	return &recordSet{
 		executor: e,
-		fields:   fs,
 		schema:   e.Schema(),
 	}, nil
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -54,6 +55,7 @@ func (rp rangePoint) String() string {
 type rangePointSorter struct {
 	points []rangePoint
 	err    error
+	sc     *variable.StatementContext
 }
 
 func (r *rangePointSorter) Len() int {
@@ -63,22 +65,26 @@ func (r *rangePointSorter) Len() int {
 func (r *rangePointSorter) Less(i, j int) bool {
 	a := r.points[i]
 	b := r.points[j]
-	cmp, err := a.value.CompareDatum(b.value)
+	less, err := rangePointLess(r.sc, a, b)
 	if err != nil {
 		r.err = err
-		return true
 	}
-	if cmp == 0 {
-		return r.equalValueLess(a, b)
-	}
-	return cmp < 0
+	return less
 }
 
-func (r *rangePointSorter) equalValueLess(a, b rangePoint) bool {
+func rangePointLess(sc *variable.StatementContext, a, b rangePoint) (bool, error) {
+	cmp, err := a.value.CompareDatum(sc, b.value)
+	if cmp != 0 {
+		return cmp < 0, nil
+	}
+	return rangePointEqualValueLess(a, b), errors.Trace(err)
+}
+
+func rangePointEqualValueLess(a, b rangePoint) bool {
 	if a.start && b.start {
 		return !a.excl && b.excl
 	} else if a.start {
-		return !b.excl
+		return !a.excl && !b.excl
 	} else if b.start {
 		return a.excl || b.excl
 	}
@@ -91,6 +97,7 @@ func (r *rangePointSorter) Swap(i, j int) {
 
 type rangeBuilder struct {
 	err error
+	sc  *variable.StatementContext
 }
 
 func (r *rangeBuilder) build(expr expression.Expression) []rangePoint {
@@ -111,7 +118,7 @@ func (r *rangeBuilder) buildFromConstant(expr *expression.Constant) []rangePoint
 		return nil
 	}
 
-	val, err := expr.Value.ToBool()
+	val, err := expr.Value.ToBool(r.sc)
 	if err != nil {
 		r.err = err
 		return nil
@@ -245,7 +252,7 @@ func (r *rangeBuilder) newBuildFromIn(expr *expression.ScalarFunction) []rangePo
 		endPoint := rangePoint{value: types.NewDatum(v.Value.GetValue())}
 		rangePoints = append(rangePoints, startPoint, endPoint)
 	}
-	sorter := rangePointSorter{points: rangePoints}
+	sorter := rangePointSorter{points: rangePoints, sc: r.sc}
 	sort.Sort(&sorter)
 	if sorter.err != nil {
 		r.err = sorter.err
@@ -403,7 +410,7 @@ func (r *rangeBuilder) union(a, b []rangePoint) []rangePoint {
 }
 
 func (r *rangeBuilder) merge(a, b []rangePoint, union bool) []rangePoint {
-	sorter := rangePointSorter{points: append(a, b...)}
+	sorter := rangePointSorter{points: append(a, b...), sc: r.sc}
 	sort.Sort(&sorter)
 	if sorter.err != nil {
 		r.err = sorter.err
@@ -440,11 +447,18 @@ func (r *rangeBuilder) merge(a, b []rangePoint, union bool) []rangePoint {
 // buildIndexRanges build index ranges from range points.
 // Only the first column in the index is built, extra column ranges will be appended by
 // appendIndexRanges.
-func (r *rangeBuilder) buildIndexRanges(rangePoints []rangePoint) []*IndexRange {
+func (r *rangeBuilder) buildIndexRanges(rangePoints []rangePoint, tp *types.FieldType) []*IndexRange {
 	indexRanges := make([]*IndexRange, 0, len(rangePoints)/2)
 	for i := 0; i < len(rangePoints); i += 2 {
-		startPoint := rangePoints[i]
-		endPoint := rangePoints[i+1]
+		startPoint := r.convertPoint(rangePoints[i], tp)
+		endPoint := r.convertPoint(rangePoints[i+1], tp)
+		less, err := rangePointLess(r.sc, startPoint, endPoint)
+		if err != nil {
+			r.err = errors.Trace(err)
+		}
+		if !less {
+			continue
+		}
 		ir := &IndexRange{
 			LowVal:      []types.Datum{startPoint.value},
 			LowExclude:  startPoint.excl,
@@ -456,32 +470,85 @@ func (r *rangeBuilder) buildIndexRanges(rangePoints []rangePoint) []*IndexRange 
 	return indexRanges
 }
 
+func (r *rangeBuilder) convertPoint(point rangePoint, tp *types.FieldType) rangePoint {
+	switch point.value.Kind() {
+	case types.KindMaxValue, types.KindMinNotNull:
+		return point
+	}
+	casted, err := point.value.ConvertTo(r.sc, tp)
+	if err != nil {
+		r.err = errors.Trace(err)
+	}
+	valCmpCasted, err := point.value.CompareDatum(r.sc, casted)
+	if err != nil {
+		r.err = errors.Trace(err)
+	}
+	point.value = casted
+	if valCmpCasted == 0 {
+		return point
+	}
+	if point.start {
+		if point.excl {
+			if valCmpCasted < 0 {
+				// e.g. "a > 1.9" convert to "a >= 2".
+				point.excl = false
+			}
+		} else {
+			if valCmpCasted > 0 {
+				// e.g. "a >= 1.1 convert to "a > 1"
+				point.excl = true
+			}
+		}
+	} else {
+		if point.excl {
+			if valCmpCasted > 0 {
+				// e.g. "a < 1.1" convert to "a <= 1"
+				point.excl = false
+			}
+		} else {
+			if valCmpCasted < 0 {
+				// e.g. "a <= 1.9" convert to "a < 2"
+				point.excl = true
+			}
+		}
+	}
+	return point
+}
+
 // appendIndexRanges appends additional column ranges for multi-column index.
 // The additional column ranges can only be appended to point ranges.
 // for example we have an index (a, b), if the condition is (a > 1 and b = 2)
 // then we can not build a conjunctive ranges for this index.
-func (r *rangeBuilder) appendIndexRanges(origin []*IndexRange, rangePoints []rangePoint) []*IndexRange {
+func (r *rangeBuilder) appendIndexRanges(origin []*IndexRange, rangePoints []rangePoint, ft *types.FieldType) []*IndexRange {
 	var newIndexRanges []*IndexRange
 	for i := 0; i < len(origin); i++ {
 		oRange := origin[i]
-		if !oRange.IsPoint() {
+		if !oRange.IsPoint(r.sc) {
 			newIndexRanges = append(newIndexRanges, oRange)
 		} else {
-			newIndexRanges = append(newIndexRanges, r.appendIndexRange(oRange, rangePoints)...)
+			newIndexRanges = append(newIndexRanges, r.appendIndexRange(oRange, rangePoints, ft)...)
 		}
 	}
 	return newIndexRanges
 }
 
-func (r *rangeBuilder) appendIndexRange(origin *IndexRange, rangePoints []rangePoint) []*IndexRange {
+func (r *rangeBuilder) appendIndexRange(origin *IndexRange, rangePoints []rangePoint, ft *types.FieldType) []*IndexRange {
 	newRanges := make([]*IndexRange, 0, len(rangePoints)/2)
 	for i := 0; i < len(rangePoints); i += 2 {
-		startPoint := rangePoints[i]
+		startPoint := r.convertPoint(rangePoints[i], ft)
+		endPoint := r.convertPoint(rangePoints[i+1], ft)
+		less, err := rangePointLess(r.sc, startPoint, endPoint)
+		if err != nil {
+			r.err = errors.Trace(err)
+		}
+		if !less {
+			continue
+		}
+
 		lowVal := make([]types.Datum, len(origin.LowVal)+1)
 		copy(lowVal, origin.LowVal)
 		lowVal[len(origin.LowVal)] = startPoint.value
 
-		endPoint := rangePoints[i+1]
 		highVal := make([]types.Datum, len(origin.HighVal)+1)
 		copy(highVal, origin.HighVal)
 		highVal[len(origin.HighVal)] = endPoint.value
@@ -504,13 +571,13 @@ func (r *rangeBuilder) buildTableRanges(rangePoints []rangePoint) []TableRange {
 		if startPoint.value.IsNull() || startPoint.value.Kind() == types.KindMinNotNull {
 			startPoint.value.SetInt64(math.MinInt64)
 		}
-		startInt, err := startPoint.value.ToInt64()
+		startInt, err := startPoint.value.ToInt64(r.sc)
 		if err != nil {
 			r.err = errors.Trace(err)
 			return tableRanges
 		}
 		startDatum := types.NewDatum(startInt)
-		cmp, err := startDatum.CompareDatum(startPoint.value)
+		cmp, err := startDatum.CompareDatum(r.sc, startPoint.value)
 		if err != nil {
 			r.err = errors.Trace(err)
 			return tableRanges
@@ -524,13 +591,13 @@ func (r *rangeBuilder) buildTableRanges(rangePoints []rangePoint) []TableRange {
 		} else if endPoint.value.Kind() == types.KindMaxValue {
 			endPoint.value.SetInt64(math.MaxInt64)
 		}
-		endInt, err := endPoint.value.ToInt64()
+		endInt, err := endPoint.value.ToInt64(r.sc)
 		if err != nil {
 			r.err = errors.Trace(err)
 			return tableRanges
 		}
 		endDatum := types.NewDatum(endInt)
-		cmp, err = endDatum.CompareDatum(endPoint.value)
+		cmp, err = endDatum.CompareDatum(r.sc, endPoint.value)
 		if err != nil {
 			r.err = errors.Trace(err)
 			return tableRanges

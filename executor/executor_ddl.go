@@ -25,10 +25,14 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/sessionctx/varsutil"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/types"
 )
 
 // DDLExec represents a DDL executor.
+// It grabs a DDL instance from Domain, calling the DDL methods to do the work.
 type DDLExec struct {
 	Statement ast.StmtNode
 	ctx       context.Context
@@ -36,13 +40,8 @@ type DDLExec struct {
 	done      bool
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *DDLExec) Schema() expression.Schema {
-	return nil
-}
-
-// Fields implements Executor Fields interface.
-func (e *DDLExec) Fields() []*ast.ResultField {
 	return nil
 }
 
@@ -77,7 +76,7 @@ func (e *DDLExec) Next() (*Row, error) {
 	return nil, nil
 }
 
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *DDLExec) Close() error {
 	return nil
 }
@@ -117,7 +116,7 @@ func (e *DDLExec) executeCreateTable(s *ast.CreateTableStmt) error {
 		if s.IfNotExists {
 			return nil
 		}
-		return infoschema.ErrTableExists.Gen("CREATE TABLE: table exists %s", ident)
+		return err
 	}
 	return errors.Trace(err)
 }
@@ -129,12 +128,25 @@ func (e *DDLExec) executeCreateIndex(s *ast.CreateIndexStmt) error {
 }
 
 func (e *DDLExec) executeDropDatabase(s *ast.DropDatabaseStmt) error {
-	err := sessionctx.GetDomain(e.ctx).DDL().DropSchema(e.ctx, model.NewCIStr(s.Name))
+	dbName := model.NewCIStr(s.Name)
+	err := sessionctx.GetDomain(e.ctx).DDL().DropSchema(e.ctx, dbName)
 	if terror.ErrorEqual(err, infoschema.ErrDatabaseNotExists) {
 		if s.IfExists {
 			err = nil
 		} else {
-			err = infoschema.ErrDatabaseDropExists.Gen("Can't drop database '%s'; database doesn't exist", s.Name)
+			err = infoschema.ErrDatabaseDropExists.GenByArgs(s.Name)
+		}
+	}
+	sessionVars := e.ctx.GetSessionVars()
+	if err == nil && strings.ToLower(sessionVars.CurrentDB) == dbName.L {
+		sessionVars.CurrentDB = ""
+		err = varsutil.SetSystemVar(sessionVars, variable.CharsetDatabase, types.NewStringDatum("utf8"))
+		if err != nil {
+			return errors.Trace(err)
+		}
+		err = varsutil.SetSystemVar(sessionVars, variable.CollationDatabase, types.NewStringDatum("utf8_unicode_ci"))
+		if err != nil {
+			return errors.Trace(err)
 		}
 	}
 	return errors.Trace(err)
@@ -152,7 +164,7 @@ func (e *DDLExec) executeDropTable(s *ast.DropTableStmt) error {
 			continue
 		}
 		tb, err := e.is.TableByName(tn.Schema, tn.Name)
-		if err != nil && strings.HasSuffix(err.Error(), "not exist") {
+		if err != nil && infoschema.ErrTableNotExists.Equal(err) {
 			notExistTables = append(notExistTables, fullti.String())
 			continue
 		} else if err != nil {
@@ -176,7 +188,7 @@ func (e *DDLExec) executeDropTable(s *ast.DropTableStmt) error {
 		}
 	}
 	if len(notExistTables) > 0 && !s.IfExists {
-		return infoschema.ErrTableDropExists.Gen("DROP TABLE: table %s does not exist", strings.Join(notExistTables, ","))
+		return infoschema.ErrTableDropExists.GenByArgs(strings.Join(notExistTables, ","))
 	}
 	return nil
 }
@@ -194,16 +206,4 @@ func (e *DDLExec) executeAlterTable(s *ast.AlterTableStmt) error {
 	ti := ast.Ident{Schema: s.Table.Schema, Name: s.Table.Name}
 	err := sessionctx.GetDomain(e.ctx).DDL().AlterTable(e.ctx, ti, s.Specs)
 	return errors.Trace(err)
-}
-
-func joinColumnName(columnName *ast.ColumnName) string {
-	var originStrs []string
-	if columnName.Schema.O != "" {
-		originStrs = append(originStrs, columnName.Schema.O)
-	}
-	if columnName.Table.O != "" {
-		originStrs = append(originStrs, columnName.Table.O)
-	}
-	originStrs = append(originStrs, columnName.Name.O)
-	return strings.Join(originStrs, ".")
 }

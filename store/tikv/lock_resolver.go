@@ -21,6 +21,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/pd/pd-client"
+	"golang.org/x/net/context"
 )
 
 const resolvedCacheSize = 512
@@ -46,12 +47,12 @@ func newLockResolver(store *tikvStore) *LockResolver {
 }
 
 // NewLockResolver creates a LockResolver.
-func NewLockResolver(etcdAddrs []string, clusterID uint64) (*LockResolver, error) {
-	uuid := fmt.Sprintf("tikv-%v-%v", etcdAddrs, clusterID)
-	pdCli, err := pd.NewClient(etcdAddrs, clusterID)
+func NewLockResolver(etcdAddrs []string) (*LockResolver, error) {
+	pdCli, err := pd.NewClient(etcdAddrs)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	uuid := fmt.Sprintf("tikv-%v", pdCli.GetClusterID())
 	s, err := newTikvStore(uuid, &codecPDClient{pdCli}, newRPCClient(), false)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -68,16 +69,36 @@ func (s TxnStatus) IsCommitted() bool { return s > 0 }
 // CommitTS returns the txn's commitTS. It is valid iff `IsCommitted` is true.
 func (s TxnStatus) CommitTS() uint64 { return uint64(s) }
 
-// locks after 3000ms is considered unusual (the client created the lock might
-// be dead). Other client may cleanup this kind of lock.
+// By default, locks after 3000ms is considered unusual (the client created the
+// lock might be dead). Other client may cleanup this kind of lock.
 // For locks created recently, we will do backoff and retry.
-var lockTTL uint64 = 3000
+var defaultLockTTL uint64 = 3000
+
+// TODO: Consider if it's appropriate.
+var maxLockTTL uint64 = 120000
+
+// ttl = ttlFactor * sqrt(writeSizeInMiB)
+var ttlFactor = 6000
 
 // Lock represents a lock from tikv server.
 type Lock struct {
 	Key     []byte
 	Primary []byte
 	TxnID   uint64
+	TTL     uint64
+}
+
+func newLock(l *kvrpcpb.LockInfo) *Lock {
+	ttl := l.GetLockTtl()
+	if ttl == 0 {
+		ttl = defaultLockTTL
+	}
+	return &Lock{
+		Key:     l.GetKey(),
+		Primary: l.GetPrimaryLock(),
+		TxnID:   l.GetLockVersion(),
+		TTL:     ttl,
+	}
 }
 
 func (lr *LockResolver) saveResolved(txnID uint64, status TxnStatus) {
@@ -122,7 +143,7 @@ func (lr *LockResolver) ResolveLocks(bo *Backoffer, locks []*Lock) (ok bool, err
 
 	var expiredLocks []*Lock
 	for _, l := range locks {
-		if lr.store.oracle.IsExpired(l.TxnID, lockTTL) {
+		if lr.store.oracle.IsExpired(l.TxnID, l.TTL) {
 			lockResolverCounter.WithLabelValues("expired").Inc()
 			expiredLocks = append(expiredLocks, l)
 		} else {
@@ -161,7 +182,7 @@ func (lr *LockResolver) ResolveLocks(bo *Backoffer, locks []*Lock) (ok bool, err
 // To avoid unnecessarily aborting too many txns, it is wiser to wait a few
 // seconds before calling it after Prewrite.
 func (lr *LockResolver) GetTxnStatus(txnID uint64, primary []byte) (TxnStatus, error) {
-	bo := NewBackoffer(cleanupMaxBackoff)
+	bo := NewBackoffer(cleanupMaxBackoff, context.Background())
 	status, err := lr.getTxnStatus(bo, txnID, primary)
 	return status, errors.Trace(err)
 }
@@ -182,11 +203,11 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 		},
 	}
 	for {
-		region, err := lr.store.regionCache.GetRegion(bo, primary)
+		loc, err := lr.store.regionCache.LocateKey(bo, primary)
 		if err != nil {
 			return status, errors.Trace(err)
 		}
-		resp, err := lr.store.SendKVReq(bo, req, region.VerID(), readTimeoutShort)
+		resp, err := lr.store.SendKVReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return status, errors.Trace(err)
 		}
@@ -218,11 +239,11 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status TxnStatus, cleanRegions map[RegionVerID]struct{}) error {
 	lockResolverCounter.WithLabelValues("query_resolve_locks").Inc()
 	for {
-		region, err := lr.store.regionCache.GetRegion(bo, l.Key)
+		loc, err := lr.store.regionCache.LocateKey(bo, l.Key)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		if _, ok := cleanRegions[region.VerID()]; ok {
+		if _, ok := cleanRegions[loc.Region]; ok {
 			return nil
 		}
 		req := &kvrpcpb.Request{
@@ -234,7 +255,7 @@ func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status TxnStatus, cl
 		if status.IsCommitted() {
 			req.GetCmdResolveLockReq().CommitVersion = status.CommitTS()
 		}
-		resp, err := lr.store.SendKVReq(bo, req, region.VerID(), readTimeoutShort)
+		resp, err := lr.store.SendKVReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -252,7 +273,7 @@ func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status TxnStatus, cl
 		if keyErr := cmdResp.GetError(); keyErr != nil {
 			return errors.Errorf("unexpected resolve err: %s", keyErr)
 		}
-		cleanRegions[region.VerID()] = struct{}{}
+		cleanRegions[loc.Region] = struct{}{}
 		return nil
 	}
 }

@@ -49,7 +49,7 @@ import (
 )
 
 var (
-	baseConnID uint32 = 10000
+	baseConnID uint32
 )
 
 var (
@@ -104,7 +104,6 @@ func randomBuf(size int) []byte {
 // newConn creates a new *clientConn from a net.Conn.
 // It allocates a connection ID and random salt data for authentication.
 func (s *Server) newConn(conn net.Conn) *clientConn {
-	log.Info("newConn", conn.RemoteAddr().String())
 	cc := &clientConn{
 		conn:         conn,
 		pkt:          newPacketIO(conn),
@@ -113,6 +112,7 @@ func (s *Server) newConn(conn net.Conn) *clientConn {
 		collation:    mysql.DefaultCollationID,
 		alloc:        arena.NewAllocator(32 * 1024),
 	}
+	log.Infof("[%d] new connection %s", cc.connectionID, conn.RemoteAddr().String())
 	cc.salt = randomBuf(20)
 	return cc
 }
@@ -121,12 +121,14 @@ func (s *Server) skipAuth() bool {
 	return s.cfg.SkipAuth
 }
 
+const tokenLimit = 1000
+
 // NewServer creates a new Server.
 func NewServer(cfg *Config, driver IDriver) (*Server, error) {
 	s := &Server{
 		cfg:               cfg,
 		driver:            driver,
-		concurrentLimiter: NewTokenLimiter(100),
+		concurrentLimiter: NewTokenLimiter(tokenLimit),
 		rwlock:            &sync.RWMutex{},
 		clients:           make(map[uint32]*clientConn),
 	}
@@ -187,12 +189,14 @@ func (s *Server) Close() {
 func (s *Server) onConn(c net.Conn) {
 	conn := s.newConn(c)
 	if err := conn.handshake(); err != nil {
-		log.Errorf("handshake error %s", errors.ErrorStack(err))
+		// Some keep alive services will send request to TiDB and disconnect immediately.
+		// So we use info log level.
+		log.Infof("handshake error %s", errors.ErrorStack(err))
 		c.Close()
 		return
 	}
 	defer func() {
-		log.Infof("close %s", conn)
+		log.Infof("[%d] close connection", conn.connectionID)
 	}()
 
 	s.rwlock.Lock()

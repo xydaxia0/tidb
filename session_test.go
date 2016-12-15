@@ -18,19 +18,16 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/autocommit"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/sessionctx/varsutil"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
@@ -59,11 +56,15 @@ func (s *testSessionSuite) SetUpSuite(c *C) {
 	s.dropTableSQL = `Drop TABLE if exists t;`
 	s.createTableSQL = `CREATE TABLE t(id TEXT);`
 	s.selectSQL = `SELECT * from t;`
+	schemaExpiredRetryTimes = 3
+	checkSchemaValiditySleepTime = 20 * time.Millisecond
 	runtime.GOMAXPROCS(runtime.NumCPU())
 }
 
 func (s *testSessionSuite) TearDownSuite(c *C) {
 	removeStore(c, s.dbName)
+	schemaExpiredRetryTimes = 30
+	checkSchemaValiditySleepTime = 1 * time.Second
 }
 
 func (s *testSessionSuite) TestPrepare(c *C) {
@@ -148,6 +149,17 @@ func (s *testSessionSuite) TestAffectedRows(c *C) {
 	c.Assert(int(se.AffectedRows()), Equals, 2)
 	mustExecSQL(c, se, `insert into t values (1, 1) on duplicate key update c2=2;`)
 	c.Assert(int(se.AffectedRows()), Equals, 0)
+	createSQL := `CREATE TABLE IF NOT EXISTS test (
+	  id        VARCHAR(36) PRIMARY KEY NOT NULL,
+	  factor    INTEGER                 NOT NULL                   DEFAULT 2);`
+	mustExecSQL(c, se, createSQL)
+	insertSQL := `INSERT INTO test(id) VALUES('id') ON DUPLICATE KEY UPDATE factor=factor+3;`
+	mustExecSQL(c, se, insertSQL)
+	c.Assert(int(se.AffectedRows()), Equals, 1)
+	mustExecSQL(c, se, insertSQL)
+	c.Assert(int(se.AffectedRows()), Equals, 2)
+	mustExecSQL(c, se, insertSQL)
+	c.Assert(int(se.AffectedRows()), Equals, 2)
 
 	se.SetClientCapability(mysql.ClientFoundRows)
 	mustExecSQL(c, se, s.dropTableSQL)
@@ -276,7 +288,7 @@ func checkTxn(c *C, se Session, stmt string, expect uint16) {
 }
 
 func checkAutocommit(c *C, se Session, expect uint16) {
-	ret := variable.GetSessionVars(se.(*session)).Status & mysql.ServerStatusAutocommit
+	ret := se.(*session).sessionVars.Status & mysql.ServerStatusAutocommit
 	c.Assert(ret, Equals, expect)
 }
 
@@ -308,7 +320,7 @@ func (s *testSessionSuite) TestAutocommit(c *C) {
 	checkAutocommit(c, se, 0)
 	checkTxn(c, se, "drop table if exists t;", 0)
 	checkAutocommit(c, se, 0)
-	checkTxn(c, se, "set autocommit=1;", 0)
+	checkTxn(c, se, "set autocommit='On';", 0)
 	checkAutocommit(c, se, 2)
 
 	mustExecSQL(c, se, s.dropDBSQL)
@@ -318,7 +330,7 @@ func (s *testSessionSuite) TestAutocommit(c *C) {
 
 func checkInTrans(c *C, se Session, stmt string, expect uint16) {
 	checkTxn(c, se, stmt, expect)
-	ret := variable.GetSessionVars(se.(*session)).Status & mysql.ServerStatusInTrans
+	ret := se.(*session).sessionVars.Status & mysql.ServerStatusInTrans
 	c.Assert(ret, Equals, expect)
 }
 
@@ -1228,7 +1240,7 @@ func (s *testSessionSuite) TestShow(c *C) {
 	match(c, row.Data, "autocommit", "ON")
 
 	mustExecSQL(c, se, "drop table if exists t")
-	mustExecSQL(c, se, "create table if not exists t (c int)")
+	mustExecSQL(c, se, `create table if not exists t (c int) comment '注释'`)
 	r = mustExecSQL(c, se, `show columns from t`)
 	rows, err := GetRows(r)
 	c.Assert(err, IsNil)
@@ -1256,6 +1268,13 @@ func (s *testSessionSuite) TestShow(c *C) {
 	c.Assert(row.Data, HasLen, 2)
 	c.Assert(row.Data[0].GetString(), Equals, "t")
 
+	r = mustExecSQL(c, se, fmt.Sprintf("show table status from %s like 't';", s.dbName))
+	row, err = r.Next()
+	c.Assert(err, IsNil)
+	c.Assert(row.Data, HasLen, 18)
+	c.Assert(row.Data[0].GetString(), Equals, "t")
+	c.Assert(row.Data[17].GetString(), Equals, "注释")
+
 	r = mustExecSQL(c, se, "show databases like 'test'")
 	row, err = r.Next()
 	c.Assert(err, IsNil)
@@ -1277,7 +1296,7 @@ func (s *testSessionSuite) TestTimeFunc(c *C) {
 	store := newStore(c, s.dbName)
 	se := newSession(c, store, s.dbName)
 
-	last := time.Now().Format(mysql.TimeFormat)
+	last := time.Now().Format(types.TimeFormat)
 	r := mustExecSQL(c, se, "select now(), now(6), current_timestamp, current_timestamp(), current_timestamp(6), sysdate(), sysdate(6)")
 	row, err := r.Next()
 	c.Assert(err, IsNil)
@@ -1286,7 +1305,7 @@ func (s *testSessionSuite) TestTimeFunc(c *C) {
 		c.Assert(n.String(), GreaterEqual, last)
 	}
 
-	last = time.Now().Format(mysql.DateFormat)
+	last = time.Now().Format(types.DateFormat)
 	r = mustExecSQL(c, se, "select current_date, current_date(), curdate()")
 	row, err = r.Next()
 	c.Assert(err, IsNil)
@@ -1312,122 +1331,7 @@ func (s *testSessionSuite) TestBit(c *C) {
 	r := mustExecSQL(c, se, "select * from t where c1 = 2")
 	row, err := r.Next()
 	c.Assert(err, IsNil)
-	c.Assert(row.Data[0].GetMysqlBit(), Equals, mysql.Bit{Value: 2, Width: 2})
-
-	err = store.Close()
-	c.Assert(err, IsNil)
-}
-
-func (s *testSessionSuite) TestBootstrap(c *C) {
-	defer testleak.AfterTest(c)()
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
-	mustExecSQL(c, se, "USE mysql;")
-	r := mustExecSQL(c, se, `select * from user;`)
-	c.Assert(r, NotNil)
-	row, err := r.Next()
-	c.Assert(err, IsNil)
-	c.Assert(row, NotNil)
-	match(c, row.Data, []byte("%"), []byte("root"), []byte(""), "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y")
-
-	c.Assert(se.Auth("root@anyhost", []byte(""), []byte("")), IsTrue)
-	mustExecSQL(c, se, "USE test;")
-	// Check privilege tables.
-	mustExecSQL(c, se, "SELECT * from mysql.db;")
-	mustExecSQL(c, se, "SELECT * from mysql.tables_priv;")
-	mustExecSQL(c, se, "SELECT * from mysql.columns_priv;")
-	// Check privilege tables.
-	r = mustExecSQL(c, se, "SELECT COUNT(*) from mysql.global_variables;")
-	c.Assert(r, NotNil)
-	v, err := r.Next()
-	c.Assert(err, IsNil)
-	c.Assert(v.Data[0].GetInt64(), Equals, int64(len(variable.SysVars)))
-
-	// Check a storage operations are default autocommit after the second start.
-	mustExecSQL(c, se, "USE test;")
-	mustExecSQL(c, se, "drop table if exists t")
-	mustExecSQL(c, se, "create table t (id int)")
-	delete(storeBootstrapped, store.UUID())
-	se.Close()
-	se, err = CreateSession(store)
-	c.Assert(err, IsNil)
-	mustExecSQL(c, se, "USE test;")
-	mustExecSQL(c, se, "insert t values (?)", 3)
-	se, err = CreateSession(store)
-	c.Assert(err, IsNil)
-	mustExecSQL(c, se, "USE test;")
-	r = mustExecSQL(c, se, "select * from t")
-	c.Assert(r, NotNil)
-	v, err = r.Next()
-	c.Assert(err, IsNil)
-	match(c, v.Data, 3)
-	mustExecSQL(c, se, "drop table if exists t")
-	se.Close()
-
-	// Try do bootstrap dml jobs on an already bootstraped TiDB system will not cause fatal.
-	// For https://github.com/pingcap/tidb/issues/1096
-	store = newStore(c, s.dbName)
-	se, err = CreateSession(store)
-	c.Assert(err, IsNil)
-	doDMLWorks(se)
-
-	err = store.Close()
-	c.Assert(err, IsNil)
-}
-
-// Create a new session on store but only do ddl works.
-func (s *testSessionSuite) bootstrapWithError(store kv.Storage, c *C) {
-	ss := &session{
-		values: make(map[fmt.Stringer]interface{}),
-		store:  store,
-		sid:    atomic.AddInt64(&sessionID, 1),
-		parser: parser.New(),
-	}
-	ss.initing = true
-	domain, err := domap.Get(store)
-	c.Assert(err, IsNil)
-	sessionctx.BindDomain(ss, domain)
-	variable.BindSessionVars(ss)
-	variable.GetSessionVars(ss).SetStatusFlag(mysql.ServerStatusAutocommit, true)
-	// session implements autocommit.Checker. Bind it to ctx
-	autocommit.BindAutocommitChecker(ss, ss)
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-	b, err := checkBootstrapped(ss)
-	c.Assert(b, IsFalse)
-	c.Assert(err, IsNil)
-	doDDLWorks(ss)
-	// Leave dml unfinished.
-}
-
-func (s *testSessionSuite) TestBootstrapWithError(c *C) {
-	defer testleak.AfterTest(c)()
-	store := newStore(c, s.dbNameBootstrap)
-	s.bootstrapWithError(store, c)
-	se := newSession(c, store, s.dbNameBootstrap)
-	mustExecSQL(c, se, "USE mysql;")
-	r := mustExecSQL(c, se, `select * from user;`)
-	row, err := r.Next()
-	c.Assert(err, IsNil)
-	c.Assert(row, NotNil)
-	match(c, row.Data, []byte("%"), []byte("root"), []byte(""), "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y")
-	mustExecSQL(c, se, "USE test;")
-	// Check privilege tables.
-	mustExecSQL(c, se, "SELECT * from mysql.db;")
-	mustExecSQL(c, se, "SELECT * from mysql.tables_priv;")
-	mustExecSQL(c, se, "SELECT * from mysql.columns_priv;")
-	// Check global variables.
-	r = mustExecSQL(c, se, "SELECT COUNT(*) from mysql.global_variables;")
-	v, err := r.Next()
-	c.Assert(err, IsNil)
-	c.Assert(v.Data[0].GetInt64(), Equals, int64(len(variable.SysVars)))
-
-	r = mustExecSQL(c, se, `SELECT VARIABLE_VALUE from mysql.TiDB where VARIABLE_NAME="bootstrapped";`)
-	row, err = r.Next()
-	c.Assert(err, IsNil)
-	c.Assert(row, NotNil)
-	c.Assert(row.Data, HasLen, 1)
-	c.Assert(row.Data[0].GetBytes(), BytesEquals, []byte("True"))
+	c.Assert(row.Data[0].GetMysqlBit(), Equals, types.Bit{Value: 2, Width: 2})
 
 	err = store.Close()
 	c.Assert(err, IsNil)
@@ -1559,7 +1463,7 @@ func (s *testSessionSuite) TestDefaultFlenBug(c *C) {
 	mustExecSQL(c, se, "insert into t2 value (930);")
 	// The data in the second src will be casted as the type of the first src.
 	// If use flen=0, it will be truncated.
-	r := mustExecSQL(c, se, "select c from t1 union select c from t2;")
+	r := mustExecSQL(c, se, "select c from t1 union (select c from t2) order by c;")
 	rows, err := GetRows(r)
 	c.Assert(err, IsNil)
 	c.Assert(rows, HasLen, 2)
@@ -2045,13 +1949,21 @@ func (s *testSessionSuite) TestIssue1265(c *C) {
 	mustExecFailed(c, se, "insert t values ('1e2');")
 }
 
+/*
 func (s *testSessionSuite) TestIssue1435(c *C) {
 	defer testleak.AfterTest(c)()
-	store := newStore(c, s.dbName)
+	localstore.MockRemoteStore = true
+	store := newStore(c, s.dbName+"issue1435")
 	se := newSession(c, store, s.dbName)
 	se1 := newSession(c, store, s.dbName)
 	se2 := newSession(c, store, s.dbName)
+	// Make sure statements can't retry.
+	se.(*session).sessionVars.RetryInfo.Retrying = true
+	se1.(*session).sessionVars.RetryInfo.Retrying = true
+	se2.(*session).sessionVars.RetryInfo.Retrying = true
 
+	ctx := se.(context.Context)
+	sessionctx.GetDomain(ctx).SetLease(20 * time.Millisecond)
 	mustExecSQL(c, se, "drop table if exists t;")
 	mustExecSQL(c, se, "create table t (a int);")
 	mustExecSQL(c, se, "drop table if exists t1;")
@@ -2096,9 +2008,10 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 	default:
 	}
 	// Make sure loading information schema is failed and server is invalid.
-	ctx := se.(context.Context)
-	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed = true
-	sessionctx.GetDomain(ctx).MustReload()
+	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed.SetValue(true)
+	sessionctx.GetDomain(ctx).Reload()
+	lease := sessionctx.GetDomain(ctx).DDL().GetLease()
+	time.Sleep(lease)
 	// Make sure insert to table t1 transaction executes.
 	startCh1 <- struct{}{}
 	// Make sure executing insert statement is failed when server is invalid.
@@ -2114,15 +2027,20 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 		c.FailNow()
 	default:
 	}
-	sessionctx.GetDomain(ctx).SchemaValidity.SetValidity(true)
-	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed = false
+
+	ver, err := store.CurrentVersion()
+	c.Assert(err, IsNil)
+	c.Assert(ver, NotNil)
+	sessionctx.GetDomain(ctx).SchemaValidity.SetExpireInfo(false, ver.Ver)
+	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed.SetValue(false)
+	time.Sleep(lease)
 	mustExecSQL(c, se, "drop table if exists t;")
 	mustExecSQL(c, se, "create table t (a int);")
 	mustExecSQL(c, se, "insert t values (100);")
 	// Make sure insert to table t2 transaction executes.
 	startCh2 <- struct{}{}
 	err = <-endCh2
-	c.Assert(err, IsNil)
+	c.Assert(err, IsNil, Commentf("err:%v", err))
 
 	err = se.Close()
 	c.Assert(err, IsNil)
@@ -2132,7 +2050,9 @@ func (s *testSessionSuite) TestIssue1435(c *C) {
 	c.Assert(err, IsNil)
 	err = store.Close()
 	c.Assert(err, IsNil)
+	localstore.MockRemoteStore = false
 }
+*/
 
 // Testcase for session
 func (s *testSessionSuite) TestSession(c *C) {
@@ -2214,21 +2134,19 @@ func (s *testSessionSuite) TestMultiColumnIndex(c *C) {
 	mustExecSQL(c, se, "insert into t values (1, 5)")
 
 	sql := "select c1 from t where c1 in (1) and c2 < 10"
-	expectedExplain := "Index(t.idx_c1_c2)[[1,1]]->Projection"
-	checkPlan(c, se, sql, expectedExplain)
+	checkPlan(c, se, sql, "Index(t.idx_c1_c2)[[1 -inf,1 10)]->Projection")
 	mustExecMatch(c, se, sql, [][]interface{}{{1}})
 
 	sql = "select c1 from t where c1 in (1) and c2 > 3"
-	checkPlan(c, se, sql, expectedExplain)
+	checkPlan(c, se, sql, "Index(t.idx_c1_c2)[(1 3,1 +inf]]->Projection")
 	mustExecMatch(c, se, sql, [][]interface{}{{1}})
 
 	sql = "select c1 from t where c1 in (1) and c2 < 5.1"
-	checkPlan(c, se, sql, expectedExplain)
+	checkPlan(c, se, sql, "Index(t.idx_c1_c2)[[1 -inf,1 5]]->Projection")
 	mustExecMatch(c, se, sql, [][]interface{}{{1}})
 
 	sql = "select c1 from t where c1 in (1.1) and c2 > 3"
-	expectedExplain = "Index(t.idx_c1_c2)[[1.1,1.1]]->Projection"
-	checkPlan(c, se, sql, expectedExplain)
+	checkPlan(c, se, sql, "Index(t.idx_c1_c2)[]->Projection")
 	mustExecMatch(c, se, sql, [][]interface{}{})
 
 	// Test varchar type.
@@ -2391,34 +2309,34 @@ func (s *testSessionSuite) TestGlobalVarAccessor(c *C) {
 	store := newStore(c, s.dbName)
 	se := newSession(c, store, s.dbName).(*session)
 	// Get globalSysVar twice and get the same value
-	v, err := se.GetGlobalSysVar(se, varName)
+	v, err := se.GetGlobalSysVar(varName)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, varValue)
-	v, err = se.GetGlobalSysVar(se, varName)
+	v, err = se.GetGlobalSysVar(varName)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, varValue)
 	// Set global var to another value
-	err = se.SetGlobalSysVar(se, varName, varValue1)
+	err = se.SetGlobalSysVar(varName, varValue1)
 	c.Assert(err, IsNil)
-	v, err = se.GetGlobalSysVar(se, varName)
+	v, err = se.GetGlobalSysVar(varName)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, varValue1)
 	c.Assert(se.CommitTxn(), IsNil)
 
 	// Change global variable value in another session
 	se1 := newSession(c, store, s.dbName).(*session)
-	v, err = se1.GetGlobalSysVar(se1, varName)
+	v, err = se1.GetGlobalSysVar(varName)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, varValue1)
-	err = se1.SetGlobalSysVar(se1, varName, varValue2)
+	err = se1.SetGlobalSysVar(varName, varValue2)
 	c.Assert(err, IsNil)
-	v, err = se1.GetGlobalSysVar(se1, varName)
+	v, err = se1.GetGlobalSysVar(varName)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, varValue2)
 	c.Assert(se1.CommitTxn(), IsNil)
 
 	// Make sure the change is visible to any client that accesses that global variable.
-	v, err = se.GetGlobalSysVar(se, varName)
+	v, err = se.GetGlobalSysVar(varName)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, varValue2)
 
@@ -2467,9 +2385,9 @@ func newSessionWithoutInit(c *C, store kv.Storage) *session {
 	s := &session{
 		values:      make(map[fmt.Stringer]interface{}),
 		store:       store,
-		sid:         atomic.AddInt64(&sessionID, 1),
 		debugInfos:  make(map[string]interface{}),
 		maxRetryCnt: 10,
+		sessionVars: variable.NewSessionVars(),
 	}
 	return s
 }
@@ -2479,10 +2397,10 @@ func (s *testSessionSuite) TestRetryAttempts(c *C) {
 	store := kv.NewMockStorage()
 	se := newSessionWithoutInit(c, store)
 	c.Assert(se, NotNil)
-	variable.BindSessionVars(se)
-	sv := variable.GetSessionVars(se)
+	sv := se.sessionVars
 	// Prevent getting variable value from storage.
-	sv.SetSystemVar("autocommit", types.NewDatum("ON"))
+	varsutil.SetSystemVar(se.sessionVars, "autocommit", types.NewDatum("ON"))
+	sv.CommonGlobalLoaded = true
 
 	// Add retry info.
 	retryInfo := sv.RetryInfo
@@ -2564,4 +2482,40 @@ func (s *testSessionSuite) TestSelectHaving(c *C) {
 	mustExecMatch(c, se, sql, [][]interface{}{{"1", fmt.Sprintf("%v", []byte("hello"))}})
 	mustExecMultiSQL(c, se, "select * from select_having_test group by id having null is not null;")
 	mustExecMultiSQL(c, se, "drop table select_having_test")
+}
+
+func (s *testSessionSuite) TestQueryString(c *C) {
+	store := newStore(c, s.dbName)
+	se := newSession(c, store, s.dbName)
+	mustExecute(se, "use "+s.dbName)
+	_, err := se.Execute("create table mutil1 (a int);create table multi2 (a int)")
+	c.Assert(err, IsNil)
+	ctx := se.(context.Context)
+	queryStr := ctx.Value(context.QueryString)
+	c.Assert(queryStr, Equals, "create table multi2 (a int)")
+}
+
+// Test that the auto_increment ID does not reuse the old table's allocator.
+func (s *testSessionSuite) TestTruncateAlloc(c *C) {
+	store := newStore(c, s.dbName)
+	se := newSession(c, store, s.dbName)
+	mustExecute(se, "use "+s.dbName)
+	_, err := se.Execute("create table truncate_id (a int primary key auto_increment)")
+	c.Assert(err, IsNil)
+	mustExecute(se, "insert truncate_id values (), (), (), (), (), (), (), (), (), ()")
+	mustExecute(se, "truncate table truncate_id")
+	mustExecute(se, "insert truncate_id values (), (), (), (), (), (), (), (), (), ()")
+	rset := mustExecSQL(c, se, "select a from truncate_id where a > 11")
+	row, err := rset.Next()
+	c.Assert(err, IsNil)
+	c.Assert(row, IsNil)
+}
+
+// Test infomation_schema.columns.
+func (s *testSessionSuite) TestISColumns(c *C) {
+	defer testleak.AfterTest(c)()
+	store := newStore(c, s.dbName)
+	se := newSession(c, store, s.dbName)
+	sql := "select ORDINAL_POSITION from INFORMATION_SCHEMA.COLUMNS;"
+	mustExecSQL(c, se, sql)
 }

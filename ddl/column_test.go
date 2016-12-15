@@ -24,11 +24,11 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
@@ -47,11 +47,11 @@ func (s *testColumnSuite) SetUpSuite(c *C) {
 	s.d = newDDL(s.store, nil, nil, testLease)
 
 	s.dbInfo = testSchemaInfo(c, s.d, "test_column")
-	testCreateSchema(c, mock.NewContext(), s.d, s.dbInfo)
+	testCreateSchema(c, testNewContext(c, s.d), s.d, s.dbInfo)
 }
 
 func (s *testColumnSuite) TearDownSuite(c *C) {
-	testDropSchema(c, mock.NewContext(), s.d, s.dbInfo)
+	testDropSchema(c, testNewContext(c, s.d), s.d, s.dbInfo)
 	s.d.close()
 
 	err := s.store.Close()
@@ -65,11 +65,7 @@ func testCreateColumn(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, t
 		Offset:       len(tblInfo.Columns),
 		DefaultValue: defaultValue,
 	}
-
-	var err error
-	col.ID, err = d.genGlobalID()
-	c.Assert(err, IsNil)
-
+	col.ID = allocateColumnID(tblInfo)
 	col.FieldType = *types.NewFieldType(mysql.TypeLong)
 
 	job := &model.Job{
@@ -79,8 +75,10 @@ func testCreateColumn(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, t
 		Args:     []interface{}{col, pos, 0},
 	}
 
-	err = d.doDDLJob(ctx, job)
+	err := d.doDDLJob(ctx, job)
 	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
 	return job
 }
 
@@ -97,14 +95,15 @@ func testDropColumn(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tbl
 		return nil
 	}
 	c.Assert(errors.ErrorStack(err), Equals, "")
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
 	return job
 }
 
 func (s *testColumnSuite) TestColumn(c *C) {
 	defer testleak.AfterTest(c)()
 	tblInfo := testTableInfo(c, s.d, "t1", 3)
-	var ctx context.Context
-	ctx = testNewContext(c, s.d)
+	ctx := testNewContext(c, s.d)
 	defer ctx.RollbackTxn()
 
 	testCreateTable(c, ctx, s.d, s.dbInfo, tblInfo)
@@ -863,4 +862,37 @@ func (s *testColumnSuite) TestDropColumn(c *C) {
 
 	d.close()
 	s.d.start()
+}
+
+func (s *testColumnSuite) TestModifyColumn(c *C) {
+	d := newDDL(s.store, nil, nil, testLease)
+	cases := []struct {
+		origin string
+		to     string
+		ok     bool
+	}{
+		{"int", "bigint", true},
+		{"int", "int unsigned", false},
+		{"varchar(10)", "text", true},
+		{"varbinary(10)", "blob", true},
+		{"text", "blob", false},
+		{"varchar(10)", "varchar(8)", false},
+		{"varchar(10)", "varchar(11)", true},
+	}
+	for _, ca := range cases {
+		ftA := s.colDefStrToFieldType(c, ca.origin)
+		ftB := s.colDefStrToFieldType(c, ca.to)
+		c.Assert(d.modifiable(ftA, ftB), Equals, ca.ok)
+	}
+	d.close()
+}
+
+func (s *testColumnSuite) colDefStrToFieldType(c *C, str string) *types.FieldType {
+	sqlA := "alter table t modify column a " + str
+	stmt, err := parser.New().ParseOneStmt(sqlA, "", "")
+	c.Assert(err, IsNil)
+	colDef := stmt.(*ast.AlterTableStmt).Specs[0].NewColumn
+	col, _, err := columnDefToCol(nil, 0, colDef)
+	c.Assert(err, IsNil)
+	return &col.FieldType
 }

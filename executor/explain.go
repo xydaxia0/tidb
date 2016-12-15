@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/util/types"
@@ -26,38 +25,57 @@ import (
 // ExplainExec represents an explain executor.
 // See https://dev.mysql.com/doc/refman/5.7/en/explain-output.html
 type ExplainExec struct {
-	StmtPlan  plan.Plan
-	schema    expression.Schema
-	evaluated bool
+	StmtPlan plan.Plan
+	schema   expression.Schema
+	rows     []*Row
+	cursor   int
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *ExplainExec) Schema() expression.Schema {
 	return e.schema
 }
 
-// Fields implements Executor Fields interface.
-func (e *ExplainExec) Fields() []*ast.ResultField {
+func (e *ExplainExec) prepareExplainInfo(p plan.Plan, parent plan.Plan) error {
+	for _, child := range p.GetChildren() {
+		err := e.prepareExplainInfo(child, p)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	explain, err := json.MarshalIndent(p, "", "    ")
+	if err != nil {
+		return errors.Trace(err)
+	}
+	parentStr := ""
+	if parent != nil {
+		parentStr = parent.GetID()
+	}
+	row := &Row{
+		Data: types.MakeDatums(p.GetID(), string(explain), parentStr),
+	}
+	e.rows = append(e.rows, row)
 	return nil
 }
 
 // Next implements Execution Next interface.
 func (e *ExplainExec) Next() (*Row, error) {
-	if e.evaluated {
+	if e.cursor == 0 {
+		err := e.prepareExplainInfo(e.StmtPlan, nil)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	if e.cursor >= len(e.rows) {
 		return nil, nil
 	}
-	e.evaluated = true
-	explain, err := json.MarshalIndent(e.StmtPlan, "", "    ")
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	row := &Row{
-		Data: types.MakeDatums("EXPLAIN", string(explain)),
-	}
+	row := e.rows[e.cursor]
+	e.cursor++
 	return row, nil
 }
 
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *ExplainExec) Close() error {
+	e.rows = nil
 	return nil
 }

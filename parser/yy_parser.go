@@ -17,13 +17,14 @@ import (
 	"math"
 	"regexp"
 	"strconv"
-	"strings"
 	"unicode"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/types"
 )
 
 // Error instances.
@@ -45,20 +46,6 @@ var (
 func trimComment(txt string) string {
 	txt = specCodeStart.ReplaceAllString(txt, "")
 	return specCodeEnd.ReplaceAllString(txt, "")
-}
-
-// See http://dev.mysql.com/doc/refman/5.7/en/comments.html
-// Convert "/*!VersionNumber MySQL-specific-code */" to "MySQL-specific-code".
-// TODO: Find a better way:
-// 1. RegExpr is slow.
-// 2. Handle nested comment.
-func handleMySQLSpecificCode(sql string) string {
-	if strings.Index(sql, "/*!") == -1 {
-		// Fast way to check if text contains MySQL-specific code.
-		return sql
-	}
-	// SQL text contains MySQL-specific code. We should convert it to normal SQL text.
-	return specCodePattern.ReplaceAllStringFunc(sql, trimComment)
 }
 
 // Parser represents a parser instance. Some temporary objects are stored in it to reduce object allocation during Parse function.
@@ -99,8 +86,6 @@ func (parser *Parser) Parse(sql, charset, collation string) ([]ast.StmtNode, err
 	parser.collation = collation
 	parser.src = sql
 	parser.result = parser.result[:0]
-
-	sql = handleMySQLSpecificCode(sql)
 
 	var l yyLexer
 	parser.lexer.reset(sql)
@@ -168,6 +153,16 @@ func toInt(l yyLexer, lval *yySymType, str string) int {
 	return intLit
 }
 
+func toDecimal(l yyLexer, lval *yySymType, str string) int {
+	dec := new(types.MyDecimal)
+	err := dec.FromString(hack.Slice(str))
+	if err != nil {
+		l.Errorf("decimal literal: %v", err)
+	}
+	lval.item = dec
+	return decLit
+}
+
 func toFloat(l yyLexer, lval *yySymType, str string) int {
 	n, err := strconv.ParseFloat(str, 64)
 	if err != nil {
@@ -181,16 +176,16 @@ func toFloat(l yyLexer, lval *yySymType, str string) int {
 
 // See https://dev.mysql.com/doc/refman/5.7/en/hexadecimal-literals.html
 func toHex(l yyLexer, lval *yySymType, str string) int {
-	h, err := mysql.ParseHex(str)
+	h, err := types.ParseHex(str)
 	if err != nil {
 		// If parse hexadecimal literal to numerical value error, we should treat it as a string.
-		hexStr, err1 := mysql.ParseHexStr(str)
+		hexStr, err1 := types.ParseHexStr(str)
 		if err1 != nil {
 			l.Errorf("hex literal: %v", err)
 			return int(unicode.ReplacementChar)
 		}
 		lval.item = hexStr
-		return stringLit
+		return hexLit
 	}
 	lval.item = h
 	return hexLit
@@ -198,7 +193,7 @@ func toHex(l yyLexer, lval *yySymType, str string) int {
 
 // See https://dev.mysql.com/doc/refman/5.7/en/bit-type.html
 func toBit(l yyLexer, lval *yySymType, str string) int {
-	b, err := mysql.ParseBit(str, -1)
+	b, err := types.ParseBit(str, -1)
 	if err != nil {
 		l.Errorf("bit literal: %v", err)
 		return int(unicode.ReplacementChar)

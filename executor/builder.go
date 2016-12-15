@@ -15,6 +15,7 @@ package executor
 
 import (
 	"math"
+	"strings"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
@@ -23,18 +24,16 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/parser/opcode"
 	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/sessionctx/autocommit"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
 )
 
 // executorBuilder builds an Executor from a Plan.
-// The InfoSchema must be the same one used in InfoBinder.
+// The InfoSchema must not change during execution.
 type executorBuilder struct {
 	ctx context.Context
 	is  infoschema.InfoSchema
+	// If there is any error during Executor building process, err is set.
 	err error
 }
 
@@ -63,9 +62,6 @@ func (b *executorBuilder) build(p plan.Plan) Executor {
 		return b.buildExecute(v)
 	case *plan.Explain:
 		return b.buildExplain(v)
-	case *plan.Filter:
-		src := b.build(v.GetChildByIndex(0))
-		return b.buildFilter(src, v.Conditions)
 	case *plan.Insert:
 		return b.buildInsert(v)
 	case *plan.LoadData:
@@ -82,6 +78,8 @@ func (b *executorBuilder) build(p plan.Plan) Executor {
 		return b.buildShow(v)
 	case *plan.Simple:
 		return b.buildSimple(v)
+	case *plan.Set:
+		return b.buildSet(v)
 	case *plan.Sort:
 		return b.buildSort(v)
 	case *plan.Union:
@@ -116,27 +114,18 @@ func (b *executorBuilder) build(p plan.Plan) Executor {
 		return b.buildTrim(v)
 	case *plan.PhysicalDummyScan:
 		return b.buildDummyScan(v)
+	case *plan.Cache:
+		return b.buildCache(v)
 	default:
 		b.err = ErrUnknownPlan.Gen("Unknown Plan %T", p)
 		return nil
 	}
 }
 
-func (b *executorBuilder) buildFilter(src Executor, conditions []ast.ExprNode) Executor {
-	if len(conditions) == 0 {
-		return src
-	}
-	return &FilterExec{
-		Src:       src,
-		Condition: b.joinConditions(conditions),
-		ctx:       b.ctx,
-	}
-}
-
 func (b *executorBuilder) buildShowDDL(v *plan.ShowDDL) Executor {
 	return &ShowDDLExec{
-		fields: v.Fields(),
 		ctx:    b.ctx,
+		schema: v.GetSchema(),
 	}
 }
 
@@ -154,30 +143,9 @@ func (b *executorBuilder) buildDeallocate(v *plan.Deallocate) Executor {
 	}
 }
 
-func (b *executorBuilder) joinConditions(conditions []ast.ExprNode) ast.ExprNode {
-	if len(conditions) == 0 {
-		return nil
-	}
-	if len(conditions) == 1 {
-		return conditions[0]
-	}
-	condition := &ast.BinaryOperationExpr{
-		Op: opcode.AndAnd,
-		L:  conditions[0],
-		R:  b.joinConditions(conditions[1:]),
-	}
-	ast.MergeChildrenFlags(condition, condition.L, condition.R)
-	return condition
-}
-
 func (b *executorBuilder) buildSelectLock(v *plan.SelectLock) Executor {
 	src := b.build(v.GetChildByIndex(0))
-	ac, err := autocommit.ShouldAutocommit(b.ctx)
-	if err != nil {
-		b.err = errors.Trace(err)
-		return src
-	}
-	if ac {
+	if b.ctx.GetSessionVars().ShouldAutocommit() {
 		// Locking of rows for update using SELECT FOR UPDATE only applies when autocommit
 		// is disabled (either by beginning transaction with START TRANSACTION or by setting
 		// autocommit to 0. If autocommit is enabled, the rows matching the specification are not locked.
@@ -239,10 +207,10 @@ func (b *executorBuilder) buildShow(v *plan.Show) Executor {
 		GlobalScope: v.GlobalScope,
 		ctx:         b.ctx,
 		is:          b.is,
-		fields:      v.Fields(),
+		schema:      v.GetSchema(),
 	}
 	if e.Tp == ast.ShowGrants && len(e.User) == 0 {
-		e.User = variable.GetSessionVars(e.ctx).User
+		e.User = e.ctx.GetSessionVars().User
 	}
 	return e
 }
@@ -253,6 +221,13 @@ func (b *executorBuilder) buildSimple(v *plan.Simple) Executor {
 		return b.buildGrant(s)
 	}
 	return &SimpleExec{Statement: v.Statement, ctx: b.ctx}
+}
+
+func (b *executorBuilder) buildSet(v *plan.Set) Executor {
+	return &SetExecutor{
+		ctx:  b.ctx,
+		vars: v.VarAssigns,
+	}
 }
 
 func (b *executorBuilder) buildInsert(v *plan.Insert) Executor {
@@ -344,12 +319,12 @@ func (b *executorBuilder) buildExplain(v *plan.Explain) Executor {
 	}
 }
 
-func (b *executorBuilder) buildUnionScanExec(v *plan.PhysicalUnionScan) *UnionScanExec {
+func (b *executorBuilder) buildUnionScanExec(v *plan.PhysicalUnionScan) Executor {
 	src := b.build(v.GetChildByIndex(0))
 	if b.err != nil {
 		return nil
 	}
-	us := &UnionScanExec{ctx: b.ctx, Src: src}
+	us := &UnionScanExec{ctx: b.ctx, Src: src, schema: v.GetSchema()}
 	switch x := src.(type) {
 	case *XSelectTableExec:
 		us.desc = x.desc
@@ -370,7 +345,8 @@ func (b *executorBuilder) buildUnionScanExec(v *plan.PhysicalUnionScan) *UnionSc
 		us.condition = v.Condition
 		us.buildAndSortAddedRows(x.table, x.asName)
 	default:
-		b.err = ErrUnknownPlan.Gen("Unknown Plan %T", src)
+		// The mem table will not be written by sql directly, so we can omit the union scan to avoid err reporting.
+		return src
 	}
 	return us
 }
@@ -386,12 +362,13 @@ func (b *executorBuilder) buildJoin(v *plan.PhysicalHashJoin) Executor {
 		targetTypes = append(targetTypes, types.NewFieldType(types.MergeFieldType(ln.GetType().Tp, rn.GetType().Tp)))
 	}
 	e := &HashJoinExec{
-		schema:      v.GetSchema(),
-		otherFilter: expression.ComposeCNFCondition(v.OtherConditions),
-		prepared:    false,
-		ctx:         b.ctx,
-		targetTypes: targetTypes,
-		concurrency: v.Concurrency,
+		schema:        v.GetSchema(),
+		otherFilter:   expression.ComposeCNFCondition(v.OtherConditions),
+		prepared:      false,
+		ctx:           b.ctx,
+		targetTypes:   targetTypes,
+		concurrency:   v.Concurrency,
+		defaultValues: v.DefaultValues,
 	}
 	if v.SmallTable == 1 {
 		e.smallFilter = expression.ComposeCNFCondition(v.RightConditions)
@@ -419,10 +396,10 @@ func (b *executorBuilder) buildJoin(v *plan.PhysicalHashJoin) Executor {
 	for i := 0; i < e.concurrency; i++ {
 		ctx := &hashJoinCtx{}
 		if e.bigFilter != nil {
-			ctx.bigFilter = e.bigFilter.DeepCopy()
+			ctx.bigFilter = e.bigFilter.Clone()
 		}
 		if e.otherFilter != nil {
-			ctx.otherFilter = e.otherFilter.DeepCopy()
+			ctx.otherFilter = e.otherFilter.Clone()
 		}
 		ctx.datumBuffer = make([]types.Datum, len(e.bigHashKey))
 		ctx.hashKeyBuffer = make([]byte, 0, 10000)
@@ -452,7 +429,7 @@ func (b *executorBuilder) buildSemiJoin(v *plan.PhysicalHashSemiJoin) Executor {
 		ctx:          b.ctx,
 		bigHashKey:   leftHashKey,
 		smallHashKey: rightHashKey,
-		withAux:      v.WithAux,
+		auxMode:      v.WithAux,
 		anti:         v.Anti,
 		targetTypes:  targetTypes,
 	}
@@ -465,7 +442,7 @@ func (b *executorBuilder) buildAggregation(v *plan.PhysicalAggregation) Executor
 		return &StreamAggExec{
 			Src:          src,
 			schema:       v.GetSchema(),
-			ctx:          b.ctx,
+			Ctx:          b.ctx,
 			AggFuncs:     v.AggFuncs,
 			GroupByItems: v.GroupByItems,
 		}
@@ -505,7 +482,7 @@ func (b *executorBuilder) buildTableDual(v *plan.TableDual) Executor {
 }
 
 func (b *executorBuilder) getStartTS() uint64 {
-	startTS := variable.GetSnapshotTS(b.ctx)
+	startTS := b.ctx.GetSessionVars().SnapshotTS
 	if startTS == 0 {
 		txn, err := b.ctx.GetTxn(false)
 		if err != nil {
@@ -524,11 +501,7 @@ func (b *executorBuilder) buildTableScan(v *plan.PhysicalTableScan) Executor {
 	}
 	table, _ := b.is.TableByID(v.Table.ID)
 	client := b.ctx.GetClient()
-	var memDB bool
-	switch v.DBName.L {
-	case "information_schema", "performance_schema":
-		memDB = true
-	}
+	memDB := infoschema.IsMemoryDB(v.DBName.L)
 	supportDesc := client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeDesc)
 	if !memDB && client.SupportRequestType(kv.ReqTypeSelect, 0) {
 		st := &XSelectTableExec{
@@ -544,24 +517,26 @@ func (b *executorBuilder) buildTableScan(v *plan.PhysicalTableScan) Executor {
 			desc:        v.Desc,
 			limitCount:  v.LimitCount,
 			keepOrder:   v.KeepOrder,
-			where:       v.ConditionPBExpr,
+			where:       v.TableConditionPBExpr,
 			aggregate:   v.Aggregated,
-			aggFuncs:    v.AggFuncs,
+			aggFuncs:    v.AggFuncsPB,
 			aggFields:   v.AggFields,
-			byItems:     v.GbyItems,
-			orderByList: v.SortItems,
+			byItems:     v.GbyItemsPB,
+			orderByList: v.SortItemsPB,
 		}
+		st.scanConcurrency, b.err = getScanConcurrency(b.ctx)
 		return st
 	}
 
 	ts := &TableScanExec{
-		t:          table,
-		asName:     v.TableAsName,
-		ctx:        b.ctx,
-		columns:    v.Columns,
-		schema:     v.GetSchema(),
-		seekHandle: math.MinInt64,
-		ranges:     v.Ranges,
+		t:            table,
+		asName:       v.TableAsName,
+		ctx:          b.ctx,
+		columns:      v.Columns,
+		schema:       v.GetSchema(),
+		seekHandle:   math.MinInt64,
+		ranges:       v.Ranges,
+		isInfoSchema: strings.EqualFold(v.DBName.L, infoschema.Name),
 	}
 	if v.Desc {
 		return &ReverseExec{Src: ts}
@@ -576,30 +551,28 @@ func (b *executorBuilder) buildIndexScan(v *plan.PhysicalIndexScan) Executor {
 	}
 	table, _ := b.is.TableByID(v.Table.ID)
 	client := b.ctx.GetClient()
-	var memDB bool
-	switch v.DBName.L {
-	case "information_schema", "performance_schema":
-		memDB = true
-	}
+	memDB := infoschema.IsMemoryDB(v.DBName.L)
 	supportDesc := client.SupportRequestType(kv.ReqTypeIndex, kv.ReqSubTypeDesc)
 	if !memDB && client.SupportRequestType(kv.ReqTypeIndex, 0) {
 		st := &XSelectIndexExec{
-			tableInfo:   v.Table,
-			ctx:         b.ctx,
-			supportDesc: supportDesc,
-			asName:      v.TableAsName,
-			table:       table,
-			indexPlan:   v,
-			startTS:     startTS,
-			where:       v.ConditionPBExpr,
-			aggregate:   v.Aggregated,
-			aggFuncs:    v.AggFuncs,
-			aggFields:   v.AggFields,
-			byItems:     v.GbyItems,
+			tableInfo:      v.Table,
+			ctx:            b.ctx,
+			supportDesc:    supportDesc,
+			asName:         v.TableAsName,
+			table:          table,
+			indexPlan:      v,
+			singleReadMode: !v.DoubleRead,
+			startTS:        startTS,
+			where:          v.TableConditionPBExpr,
+			aggregate:      v.Aggregated,
+			aggFuncs:       v.AggFuncsPB,
+			aggFields:      v.AggFields,
+			byItems:        v.GbyItemsPB,
 		}
+		st.scanConcurrency, b.err = getScanConcurrency(b.ctx)
 		return st
 	}
-	b.err = errors.New("Not implement yet.")
+	b.err = errors.New("not implement yet")
 	return nil
 }
 
@@ -627,7 +600,7 @@ func (b *executorBuilder) buildApply(v *plan.PhysicalApply) Executor {
 	src := b.build(v.GetChildByIndex(0))
 	apply := &ApplyExec{
 		schema:      v.GetSchema(),
-		innerExec:   b.build(v.InnerPlan),
+		innerExec:   b.build(v.GetChildByIndex(1)),
 		outerSchema: v.OuterSchema,
 		Src:         src,
 	}
@@ -667,8 +640,8 @@ func (b *executorBuilder) buildTrim(v *plan.Trim) Executor {
 func (b *executorBuilder) buildUnion(v *plan.Union) Executor {
 	e := &UnionExec{
 		schema: v.GetSchema(),
-		fields: v.Fields(),
 		Srcs:   make([]Executor, len(v.GetChildren())),
+		ctx:    b.ctx,
 	}
 	for i, sel := range v.GetChildren() {
 		selExec := b.build(sel)
@@ -695,5 +668,13 @@ func (b *executorBuilder) buildDelete(v *plan.Delete) Executor {
 		SelectExec:   selExec,
 		Tables:       v.Tables,
 		IsMultiTable: v.IsMultiTable,
+	}
+}
+
+func (b *executorBuilder) buildCache(v *plan.Cache) Executor {
+	src := b.build(v.GetChildByIndex(0))
+	return &CacheExec{
+		schema: v.GetSchema(),
+		Src:    src,
 	}
 }

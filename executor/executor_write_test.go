@@ -14,24 +14,26 @@
 package executor_test
 
 import (
+	"errors"
 	"fmt"
-	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
 
 func (s *testSuite) TestInsert(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	testSQL := `drop table if exists insert_test;create table insert_test (id int PRIMARY KEY AUTO_INCREMENT, c1 int, c2 int, c3 int default 1);`
@@ -94,18 +96,42 @@ func (s *testSuite) TestInsert(c *C) {
 	c.Assert(err, NotNil)
 	tk.MustExec("rollback")
 
-	insertSQL := `insert into insert_test (id, c2) values (1, 1) on duplicate key update c2=10;`
+	// Updating column is PK handle.
+	// Make sure the record is "1, 1, nil, 1".
+	r := tk.MustQuery("select * from insert_test where id = 1;")
+	rowStr := fmt.Sprintf("%v %v %v %v", "1", "1", nil, "1")
+	r.Check(testkit.Rows(rowStr))
+	insertSQL := `insert into insert_test (id, c3) values (1, 2) on duplicate key update id=values(id), c2=10;`
 	tk.MustExec(insertSQL)
+	r = tk.MustQuery("select * from insert_test where id = 1;")
+	rowStr = fmt.Sprintf("%v %v %v %v", "1", "1", "10", "1")
+	r.Check(testkit.Rows(rowStr))
 
 	insertSQL = `insert into insert_test (id, c2) values (1, 1) on duplicate key update insert_test.c2=10;`
 	tk.MustExec(insertSQL)
 
 	_, err = tk.Exec(`insert into insert_test (id, c2) values(1, 1) on duplicate key update t.c2 = 10`)
 	c.Assert(err, NotNil)
+
+	// for on duplicate key
+	insertSQL = `INSERT INTO insert_test (id, c3) VALUES (1, 2) ON DUPLICATE KEY UPDATE c3=values(c3)+c3+3;`
+	tk.MustExec(insertSQL)
+	r = tk.MustQuery("select * from insert_test where id = 1;")
+	rowStr = fmt.Sprintf("%v %v %v %v", "1", "1", "10", "6")
+	r.Check(testkit.Rows(rowStr))
+
+	tk.MustExec("create table insert_err (id int, c1 varchar(8))")
+	_, err = tk.Exec("insert insert_err values (1, 'abcdabcdabcd')")
+	c.Assert(types.ErrDataTooLong.Equal(err), IsTrue)
+	_, err = tk.Exec("insert insert_err values (1, '你好，世界')")
+	c.Assert(err, IsNil)
 }
 
 func (s *testSuite) TestInsertAutoInc(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	createSQL := `drop table if exists insert_autoinc_test; create table insert_autoinc_test (id int primary key auto_increment, c1 int);`
@@ -189,8 +215,12 @@ func (s *testSuite) TestInsertAutoInc(c *C) {
 }
 
 func (s *testSuite) TestInsertIgnore(c *C) {
-	defer testleak.AfterTest(c)()
-	tk := testkit.NewTestKit(c, s.store)
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
+	var cfg kv.InjectionConfig
+	tk := testkit.NewTestKit(c, kv.NewInjectedStore(s.store, &cfg))
 	tk.MustExec("use test")
 	testSQL := `drop table if exists t;
     create table t (id int PRIMARY KEY AUTO_INCREMENT, c1 int);`
@@ -208,10 +238,18 @@ func (s *testSuite) TestInsertIgnore(c *C) {
 	rowStr = fmt.Sprintf("%v %v", "1", "2")
 	rowStr1 := fmt.Sprintf("%v %v", "2", "3")
 	r.Check(testkit.Rows(rowStr, rowStr1))
+
+	cfg.SetGetError(errors.New("foo"))
+	_, err := tk.Exec("insert ignore into t values (1, 3)")
+	c.Assert(err, NotNil)
+	cfg.SetGetError(nil)
 }
 
 func (s *testSuite) TestReplace(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	testSQL := `drop table if exists replace_test;
@@ -333,7 +371,10 @@ func (s *testSuite) TestReplace(c *C) {
 }
 
 func (s *testSuite) TestUpdate(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillData(tk, "update_test")
@@ -388,7 +429,6 @@ func (s *testSuite) TestUpdate(c *C) {
 	r = tk.MustQuery("select * from update_test;")
 	r.Check(testkit.Rows("2"))
 	tk.MustExec("commit")
-	tk.MustExec("drop table update_test")
 }
 
 func (s *testSuite) fillMultiTableForUpdate(tk *testkit.TestKit) {
@@ -403,7 +443,10 @@ func (s *testSuite) fillMultiTableForUpdate(tk *testkit.TestKit) {
 }
 
 func (s *testSuite) TestMultipleTableUpdate(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillMultiTableForUpdate(tk)
@@ -461,7 +504,10 @@ func (s *testSuite) TestMultipleTableUpdate(c *C) {
 }
 
 func (s *testSuite) TestDelete(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	s.fillData(tk, "delete_test")
 
@@ -508,7 +554,10 @@ func (s *testSuite) fillDataMultiTable(tk *testkit.TestKit) {
 }
 
 func (s *testSuite) TestMultiTableDelete(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	s.fillDataMultiTable(tk)
 
@@ -521,7 +570,10 @@ func (s *testSuite) TestMultiTableDelete(c *C) {
 }
 
 func (s *testSuite) TestQualifiedDelete(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t1")
@@ -555,12 +607,13 @@ func (s *testSuite) TestQualifiedDelete(c *C) {
 
 	_, err = tk.Exec("delete t1, t2 from t1 as a join t2 as b where a.c2 = b.c1")
 	c.Assert(err, NotNil)
-
-	tk.MustExec("drop table t1, t2")
 }
 
 func (s *testSuite) TestLoadData(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	createSQL := `drop table if exists load_data_test;
@@ -571,8 +624,8 @@ func (s *testSuite) TestLoadData(c *C) {
 	_, err = tk.Exec("load data infile '/tmp/nonexistence.csv' into table load_data_test")
 	c.Assert(err, NotNil)
 	tk.MustExec("load data local infile '/tmp/nonexistence.csv' into table load_data_test")
-
-	ld, ctx := makeLoadDataInfo(4, s.store, c)
+	ctx := tk.Se.(context.Context)
+	ld := makeLoadDataInfo(4, ctx, c)
 
 	deleteSQL := "delete from load_data_test"
 	selectSQL := "select * from load_data_test;"
@@ -588,6 +641,7 @@ func (s *testSuite) TestLoadData(c *C) {
 		{nil, []byte("\n"), []string{fmt.Sprintf("%v %v %v %v", 1, 0, []byte(""), 0)}, nil},
 		{nil, []byte("\t\n"), []string{fmt.Sprintf("%v %v %v %v", 2, 0, []byte(""), 0)}, nil},
 		{nil, []byte("3\t2\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4)}, nil},
+		{nil, []byte("3*1\t2\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4)}, nil},
 		{nil, []byte("4\t2\t\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 4, 2, []byte(""), 3)}, nil},
 		{nil, []byte("\t1\t2\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 5, 1, []byte("2"), 3)}, nil},
 		{nil, []byte("6\t2\t3\n"), []string{fmt.Sprintf("%v %v %v %v", 6, 2, []byte("3"), 0)}, nil},
@@ -738,13 +792,16 @@ func (s *testSuite) TestLoadData(c *C) {
 }
 
 func (s *testSuite) TestLoadDataEscape(c *C) {
-	defer testleak.AfterTest(c)()
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test; drop table if exists load_data_test;")
 	tk.MustExec("CREATE TABLE load_data_test (id INT NOT NULL PRIMARY KEY, value TEXT NOT NULL) CHARACTER SET utf8")
 	tk.MustExec("load data local infile '/tmp/nonexistence.csv' into table load_data_test")
-
-	ld, ctx := makeLoadDataInfo(2, s.store, c)
+	ctx := tk.Se.(context.Context)
+	ld := makeLoadDataInfo(2, ctx, c)
 	// test escape
 	cases := []testCase{
 		// data1 = nil, data2 != nil
@@ -760,12 +817,8 @@ func (s *testSuite) TestLoadDataEscape(c *C) {
 	checkCases(cases, ld, c, tk, ctx, selectSQL, deleteSQL)
 }
 
-func makeLoadDataInfo(column int, store kv.Storage, c *C) (ld *executor.LoadDataInfo, ctx *mock.Context) {
-	ctx = mock.NewContext()
-	ctx.Store = store
-	variable.BindSessionVars(ctx)
-	domain, err := domain.NewDomain(store, 1*time.Second)
-	c.Assert(err, IsNil)
+func makeLoadDataInfo(column int, ctx context.Context, c *C) (ld *executor.LoadDataInfo) {
+	domain := sessionctx.GetDomain(ctx)
 	is := domain.InfoSchema()
 	c.Assert(is, NotNil)
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("load_data_test"))

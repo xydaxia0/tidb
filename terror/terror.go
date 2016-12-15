@@ -75,6 +75,7 @@ const (
 	ClassVariable
 	ClassXEval
 	ClassTable
+	ClassTypes
 	// Add more as needed.
 )
 
@@ -115,6 +116,8 @@ func (ec ErrClass) String() string {
 		return "variable"
 	case ClassTable:
 		return "table"
+	case ClassTypes:
+		return "types"
 	}
 	return strconv.Itoa(int(ec))
 }
@@ -220,6 +223,14 @@ func (e *Error) getMsg() string {
 func (e *Error) Gen(format string, args ...interface{}) *Error {
 	err := *e
 	err.message = format
+	err.args = args
+	_, err.file, err.line, _ = runtime.Caller(1)
+	return &err
+}
+
+// GenByArgs generates a new *Error with the same class and code, and new arguments.
+func (e *Error) GenByArgs(args ...interface{}) *Error {
+	err := *e
 	err.args = args
 	_, err.file, err.line, _ = runtime.Caller(1)
 	return &err

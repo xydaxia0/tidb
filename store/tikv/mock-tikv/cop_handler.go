@@ -20,10 +20,12 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/distsql"
 	"github.com/pingcap/tidb/distsql/xeval"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/codec"
@@ -44,6 +46,7 @@ type selectContext struct {
 
 	// Use for DecodeRow.
 	colTps map[int64]*types.FieldType
+	sc     *variable.StatementContext
 }
 
 func (h *rpcHandler) handleCopRequest(req *coprocessor.Request) (*coprocessor.Response, error) {
@@ -64,8 +67,9 @@ func (h *rpcHandler) handleCopRequest(req *coprocessor.Request) (*coprocessor.Re
 		ctx := &selectContext{
 			sel:       sel,
 			keyRanges: req.Ranges,
+			sc:        xeval.FlagsToStatementContext(sel.Flags),
 		}
-		ctx.eval = &xeval.Evaluator{Row: make(map[int64]types.Datum)}
+		ctx.eval = xeval.NewEvaluator(ctx.sc)
 		if sel.Where != nil {
 			ctx.whereColumns = make(map[int64]*tipb.ColumnInfo)
 			collectColumnsInExpr(sel.Where, ctx, ctx.whereColumns)
@@ -107,7 +111,16 @@ func (h *rpcHandler) handleCopRequest(req *coprocessor.Request) (*coprocessor.Re
 		selResp.Error = toPBError(err)
 		selResp.Chunks = chunks
 		if err != nil {
-			resp.OtherError = err.Error()
+			if locked, ok := errors.Cause(err).(*ErrLocked); ok {
+				resp.Locked = &kvrpcpb.LockInfo{
+					Key:         locked.Key,
+					PrimaryLock: locked.Primary,
+					LockVersion: locked.StartTS,
+					LockTtl:     locked.TTL,
+				}
+			} else {
+				resp.OtherError = err.Error()
+			}
 		}
 		data, err := proto.Marshal(selResp)
 		if err != nil {
@@ -127,7 +140,7 @@ func (h *rpcHandler) getRowsFromAgg(ctx *selectContext) ([]tipb.Chunk, error) {
 		rowData = append(rowData, types.NewBytesDatum(gk))
 		for _, agg := range ctx.aggregates {
 			agg.currentGroup = gk
-			ds, err := agg.toDatums()
+			ds, err := agg.toDatums(ctx)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -455,7 +468,7 @@ func (h *rpcHandler) evalWhereForRow(ctx *selectContext, handle int64, row map[i
 	if result.IsNull() {
 		return false, nil
 	}
-	boolResult, err := result.ToBool()
+	boolResult, err := result.ToBool(ctx.sc)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
@@ -520,7 +533,6 @@ func (h *rpcHandler) getIndexRowFromRange(ctx *selectContext, ran kv.KeyRange, d
 			pair = pairs[0]
 		}
 		if pair.Err != nil {
-			// TODO: handle lock error.
 			return nil, errors.Trace(pair.Err)
 		}
 		if pair.Key == nil {

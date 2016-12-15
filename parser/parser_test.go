@@ -25,6 +25,7 @@ import (
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -36,6 +37,44 @@ type testParserSuite struct {
 func (s *testParserSuite) TestSimple(c *C) {
 	defer testleak.AfterTest(c)()
 	parser := New()
+
+	reservedKws := []string{
+		"add", "all", "alter", "analyze", "and", "as", "asc", "between", "bigint",
+		"binary", "blob", "both", "by", "cascade", "case", "change", "character", "check", "collate",
+		"column", "constraint", "convert", "create", "cross", "current_date", "current_time",
+		"current_timestamp", "current_user", "database", "databases", "day_hour", "day_microsecond",
+		"day_minute", "day_second", "decimal", "default", "delete", "desc", "describe",
+		"distinct", "div", "double", "drop", "dual", "else", "enclosed", "escaped",
+		"exists", "explain", "false", "float", "for", "force", "foreign", "from",
+		"fulltext", "grant", "group", "having", "hour_microsecond", "hour_minute",
+		"hour_second", "if", "ignore", "in", "index", "infile", "inner", "insert", "int", "into", "integer",
+		"interval", "is", "join", "key", "keys", "leading", "left", "like", "limit", "lines", "load",
+		"localtime", "localtimestamp", "lock", "longblob", "longtext", "mediumblob", "maxvalue", "mediumint", "mediumtext",
+		"minute_microsecond", "minute_second", "mod", "not", "no_write_to_binlog", "null", "numeric",
+		"on", "option", "or", "order", "outer", "partition", "precision", "primary", "procedure", "range", "read", "real",
+		"references", "regexp", "repeat", "replace", "restrict", "right", "rlike",
+		"schema", "schemas", "second_microsecond", "select", "set", "show", "smallint",
+		"starting", "table", "terminated", "then", "tinyblob", "tinyint", "tinytext", "to",
+		"trailing", "true", "union", "unique", "unlock", "unsigned",
+		"update", "use", "using", "utc_date", "values", "varbinary", "varchar",
+		"when", "where", "write", "xor", "year_month", "zerofill",
+		// TODO: support the following keywords
+		// "delayed" , "high_priority" , "low_priority", "with",
+	}
+	for _, kw := range reservedKws {
+		src := fmt.Sprintf("SELECT * FROM db.%s;", kw)
+		_, err := parser.ParseOneStmt(src, "", "")
+		c.Assert(err, IsNil, Commentf("source %s", src))
+
+		src = fmt.Sprintf("SELECT * FROM %s.desc", kw)
+		_, err = parser.ParseOneStmt(src, "", "")
+		c.Assert(err, IsNil, Commentf("source %s", src))
+
+		src = fmt.Sprintf("SELECT t.%s FROM t", kw)
+		_, err = parser.ParseOneStmt(src, "", "")
+		c.Assert(err, IsNil, Commentf("source %s", src))
+	}
+
 	// Testcase for unreserved keywords
 	unreservedKws := []string{
 		"auto_increment", "after", "begin", "bit", "bool", "boolean", "charset", "columns", "commit",
@@ -45,11 +84,11 @@ func (s *testParserSuite) TestSimple(c *C) {
 		"value", "warnings", "year", "now", "substr", "substring", "mode", "any", "some", "user", "identified",
 		"collation", "comment", "avg_row_length", "checksum", "compression", "connection", "key_block_size",
 		"max_rows", "min_rows", "national", "row", "quarter", "escape", "grants", "status", "fields", "triggers",
-		"delay_key_write", "isolation", "repeatable", "committed", "uncommitted", "only", "serializable", "level",
+		"delay_key_write", "isolation", "partitions", "repeatable", "committed", "uncommitted", "only", "serializable", "level",
 		"curtime", "variables", "dayname", "version", "btree", "hash", "row_format", "dynamic", "fixed", "compressed",
 		"compact", "redundant", "sql_no_cache sql_no_cache", "sql_cache sql_cache", "action", "round",
 		"enable", "disable", "reverse", "space", "privileges", "get_lock", "release_lock", "sleep", "no", "greatest",
-		"binlog", "hex", "unhex", "function",
+		"binlog", "hex", "unhex", "function", "indexes", "from_unixtime", "processlist", "events", "less", "than",
 	}
 	for _, kw := range unreservedKws {
 		src := fmt.Sprintf("SELECT %s FROM tbl;", kw)
@@ -78,6 +117,16 @@ func (s *testParserSuite) TestSimple(c *C) {
 	stmt := stmts[0]
 	_, ok := stmt.(*ast.SetStmt)
 	c.Assert(ok, IsTrue)
+
+	// For issue #2017
+	src = "insert into blobtable (a) values ('/*! truncated */');"
+	stmt, err = parser.ParseOneStmt(src, "", "")
+	c.Assert(err, IsNil)
+	is, ok := stmt.(*ast.InsertStmt)
+	c.Assert(ok, IsTrue)
+	c.Assert(is.Lists, HasLen, 1)
+	c.Assert(is.Lists[0], HasLen, 1)
+	c.Assert(is.Lists[0][0].GetDatum().GetString(), Equals, "/*! truncated */")
 
 	// Testcase for CONVERT(expr,type)
 	src = "SELECT CONVERT('111', SIGNED);"
@@ -238,6 +287,8 @@ func (s *testParserSuite) TestDMLStmt(c *C) {
 		{"ALTER TABLE t ADD COLUMN a SMALLINT UNSIGNED AFTER b", true},
 		{"ALTER TABLE t DISABLE KEYS", true},
 		{"ALTER TABLE t ENABLE KEYS", true},
+		{"ALTER TABLE t MODIFY COLUMN a varchar(255)", true},
+		{"ALTER TABLE t CHANGE COLUMN a b varchar(255)", true},
 
 		// from join
 		{"SELECT * from t1, t2, t3", true},
@@ -321,6 +372,7 @@ func (s *testParserSuite) TestDBAStmt(c *C) {
 		{`SHOW GRANTS`, true},
 		{`SHOW GRANTS FOR 'test'@'localhost'`, true},
 		{`SHOW COLUMNS FROM City;`, true},
+		{`SHOW COLUMNS FROM tv189.1_t_1_x;`, true},
 		{`SHOW FIELDS FROM City;`, true},
 		{`SHOW TRIGGERS LIKE 't'`, true},
 		{`SHOW DATABASES LIKE 'test2'`, true},
@@ -328,6 +380,10 @@ func (s *testParserSuite) TestDBAStmt(c *C) {
 		{`SHOW FUNCTION STATUS WHERE Db='test'`, true},
 		{`SHOW INDEX FROM t;`, true},
 		{`SHOW KEYS FROM t;`, true},
+		{`SHOW INDEX IN t;`, true},
+		{`SHOW KEYS IN t;`, true},
+		{`SHOW INDEXES IN t;`, true},
+		{`SHOW EVENTS FROM test_db WHERE definer = 'current_user'`, true},
 		// For show character set
 		{"show character set;", true},
 		// For show collation
@@ -463,6 +519,7 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 
 		// Information Functions
 		{"SELECT DATABASE();", true},
+		{"SELECT SCHEMA();", true},
 		{"SELECT USER();", true},
 		{"SELECT CURRENT_USER();", true},
 		{"SELECT CURRENT_USER;", true},
@@ -571,6 +628,15 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{`select extract(day_hour from "2011-11-11 10:10:10.123456")`, true},
 		{`select extract(year_month from "2011-11-11 10:10:10.123456")`, true},
 
+		// For from_unixtime
+		{`select from_unixtime(1447430881)`, true},
+		{`select from_unixtime(1447430881.123456)`, true},
+		{`select from_unixtime(1447430881.1234567)`, true},
+		{`select from_unixtime(1447430881.9999999)`, true},
+		{`select from_unixtime(1447430881, "%Y %D %M %h:%i:%s %x")`, true},
+		{`select from_unixtime(1447430881.123456, "%Y %D %M %h:%i:%s %x")`, true},
+		{`select from_unixtime(1447430881.1234567, "%Y %D %M %h:%i:%s %x")`, true},
+
 		// For issue 224
 		{`SELECT CAST('test collated returns' AS CHAR CHARACTER SET utf8) COLLATE utf8_bin;`, true},
 
@@ -610,6 +676,12 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{`select date_add("2011-11-11 10:10:10.123456", interval "11 10:10" day_minute)`, true},
 		{`select date_add("2011-11-11 10:10:10.123456", interval "11 10" day_hour)`, true},
 		{`select date_add("2011-11-11 10:10:10.123456", interval "11-11" year_month)`, true},
+
+		// For strcmp
+		{`select strcmp('abc', 'def')`, true},
+
+		// For utc_date
+		{`select utc_date(), utc_date()+0`, true},
 
 		// For adddate
 		{`select adddate("2011-11-11 10:10:10.123456", interval 10 microsecond)`, true},
@@ -703,9 +775,21 @@ func (s *testParserSuite) TestIdentifier(c *C) {
 		{`select 1 a, 1 "a", 1 'a'`, true},
 		{`select * from t as "a"`, false},
 		{`select * from t a`, true},
+		// reserved keyword can't be used as identifier directly, but A.B pattern is an exception
+		{`select COUNT from DESC`, false},
+		{`select COUNT from SELECT.DESC`, true},
+		{"use `select`", true},
+		{"use select", false},
 		{`select * from t as a`, true},
 		{"select 1 full, 1 row, 1 abs", true},
 		{"select * from t full, t1 row, t2 abs", true},
+		// For issue 1878, identifiers may begin with digit.
+		{"create database 123test", true},
+		{"create database 123", false},
+		{"create database `123`", true},
+		{"create table `123` (123a1 int)", true},
+		{"create table 123 (123a1 int)", false},
+		{fmt.Sprintf("select * from t%cble", 0), false},
 	}
 	s.RunTest(c, table)
 }
@@ -765,6 +849,9 @@ func (s *testParserSuite) TestDDL(c *C) {
 		{"create table t (c int) STATS_PERSISTENT = default", true},
 		{"create table t (c int) STATS_PERSISTENT = 0", true},
 		{"create table t (c int) STATS_PERSISTENT = 1", true},
+		// Partition option
+		{"create table t (c int) PARTITION BY HASH (c) PARTITIONS 32;", true},
+		{"create table t (c int) PARTITION BY RANGE (Year(VDate)) (PARTITION p1980 VALUES LESS THAN (1980) ENGINE = MyISAM, PARTITION p1990 VALUES LESS THAN (1990) ENGINE = MyISAM, PARTITION pothers VALUES LESS THAN MAXVALUE ENGINE = MyISAM)", true},
 		// For check clause
 		{"create table t (c1 bool, c2 bool, check (c1 in (0, 1)), check (c2 in (0, 1)))", true},
 		{"CREATE TABLE Customer (SD integer CHECK (SD > 0), First_Name varchar(30));", true},
@@ -788,6 +875,7 @@ func (s *testParserSuite) TestDDL(c *C) {
 		{"drop tables xxx, yyy", true},
 		{"drop table if exists xxx", true},
 		{"drop table if not exists xxx", false},
+		{"drop view if exists xxx", true},
 		// For issue 974
 		{`CREATE TABLE address (
 		id bigint(20) NOT NULL AUTO_INCREMENT,
@@ -887,7 +975,8 @@ func (s *testParserSuite) TestType(c *C) {
 		{"CREATE TABLE t( c1 TIME(2), c2 DATETIME(2), c3 TIMESTAMP(2) );", true},
 
 		// For hexadecimal
-		{"SELECT x'0a', X'11', 0x11", true},
+		{"select x'0a', X'11', 0x11", true},
+		{"select x'13181C76734725455A'", true},
 		{"select x'0xaa'", false},
 		{"select 0X11", false},
 		{"select 0x4920616D2061206C6F6E672068657820737472696E67", true},
@@ -926,6 +1015,14 @@ func (s *testParserSuite) TestPrivilege(c *C) {
 		{`CREATE USER 'root'@'localhost' IDENTIFIED BY 'new-password'`, true},
 		{`CREATE USER 'root'@'localhost' IDENTIFIED BY PASSWORD 'hashstring'`, true},
 		{`CREATE USER 'root'@'localhost' IDENTIFIED BY 'new-password', 'root'@'127.0.0.1' IDENTIFIED BY PASSWORD 'hashstring'`, true},
+		{`ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED BY 'new-password'`, true},
+		{`ALTER USER 'root'@'localhost' IDENTIFIED BY 'new-password'`, true},
+		{`ALTER USER 'root'@'localhost' IDENTIFIED BY PASSWORD 'hashstring'`, true},
+		{`ALTER USER 'root'@'localhost' IDENTIFIED BY 'new-password', 'root'@'127.0.0.1' IDENTIFIED BY PASSWORD 'hashstring'`, true},
+		{`ALTER USER USER() IDENTIFIED BY 'new-password'`, true},
+		{`ALTER USER IF EXISTS USER() IDENTIFIED BY 'new-password'`, true},
+		{`DROP USER 'root'@'localhost', 'root1'@'localhost'`, true},
+		{`DROP USER IF EXISTS 'root'@'localhost'`, true},
 
 		// For grant statement
 		{"GRANT ALL ON db1.* TO 'jeffrey'@'localhost';", true},
@@ -1080,4 +1177,17 @@ func BenchmarkParse(b *testing.B) {
 		}
 	}
 	b.ReportAllocs()
+}
+
+func (s *testParserSuite) TestExplain(c *C) {
+	defer testleak.AfterTest(c)()
+	table := []testCase{
+		{"explain select c1 from t1", true},
+		{"explain delete t1, t2 from t1 inner join t2 inner join t3 where t1.id=t2.id and t2.id=t3.id;", true},
+		{"explain insert into t values (1), (2), (3)", true},
+		{"explain replace into foo values (1 || 2)", true},
+		{"explain update t set id = id + 1 order by id desc;", true},
+		{"explain select c1 from t1 union (select c2 from t2) limit 1, 1", true},
+	}
+	s.RunTest(c, table)
 }

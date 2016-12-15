@@ -59,10 +59,6 @@ func (b *planBuilder) build(node ast.Node) Plan {
 		return b.buildAdmin(x)
 	case *ast.AlterTableStmt:
 		return b.buildDDL(x)
-	case *ast.AnalyzeTableStmt:
-		return b.buildSimple(x)
-	case *ast.BinlogStmt:
-		return b.buildSimple(x)
 	case *ast.CreateDatabaseStmt:
 		return b.buildDDL(x)
 	case *ast.CreateIndexStmt:
@@ -80,11 +76,9 @@ func (b *planBuilder) build(node ast.Node) Plan {
 	case *ast.DropTableStmt:
 		return b.buildDDL(x)
 	case *ast.ExecuteStmt:
-		return &Execute{Name: x.Name, UsingVars: x.UsingVars}
+		return b.buildExecute(x)
 	case *ast.ExplainStmt:
 		return b.buildExplain(x)
-	case *ast.FlushTableStmt:
-		return b.buildSimple(x)
 	case *ast.InsertStmt:
 		return b.buildInsert(x)
 	case *ast.LoadDataStmt:
@@ -97,31 +91,88 @@ func (b *planBuilder) build(node ast.Node) Plan {
 		return b.buildUnion(x)
 	case *ast.UpdateStmt:
 		return b.buildUpdate(x)
-	case *ast.UseStmt:
-		return b.buildSimple(x)
-	case *ast.SetStmt:
-		return b.buildSimple(x)
 	case *ast.ShowStmt:
 		return b.buildShow(x)
 	case *ast.DoStmt:
-		return b.buildSimple(x)
-	case *ast.BeginStmt:
-		return b.buildSimple(x)
-	case *ast.CommitStmt:
-		return b.buildSimple(x)
-	case *ast.RollbackStmt:
-		return b.buildSimple(x)
-	case *ast.CreateUserStmt:
-		return b.buildSimple(x)
-	case *ast.SetPwdStmt:
-		return b.buildSimple(x)
-	case *ast.GrantStmt:
-		return b.buildSimple(x)
+		return b.buildDo(x)
+	case *ast.SetStmt:
+		return b.buildSet(x)
+	case *ast.AnalyzeTableStmt, *ast.BinlogStmt, *ast.FlushTableStmt, *ast.UseStmt,
+		*ast.BeginStmt, *ast.CommitStmt, *ast.RollbackStmt, *ast.CreateUserStmt, *ast.SetPwdStmt,
+		*ast.GrantStmt, *ast.DropUserStmt, *ast.AlterUserStmt:
+		return b.buildSimple(node.(ast.StmtNode))
 	case *ast.TruncateTableStmt:
 		return b.buildDDL(x)
 	}
 	b.err = ErrUnsupportedType.Gen("Unsupported type %T", node)
 	return nil
+}
+
+func (b *planBuilder) buildExecute(v *ast.ExecuteStmt) Plan {
+	vars := make([]expression.Expression, 0, len(v.UsingVars))
+	for _, expr := range v.UsingVars {
+		newExpr, _, err := b.rewrite(expr, nil, nil, true)
+		if err != nil {
+			b.err = errors.Trace(err)
+		}
+		vars = append(vars, newExpr)
+	}
+	exe := &Execute{Name: v.Name, UsingVars: vars}
+	return exe
+}
+
+func (b *planBuilder) buildDo(v *ast.DoStmt) Plan {
+	exprs := make([]expression.Expression, 0, len(v.Exprs))
+	dual := &TableDual{
+		baseLogicalPlan: newBaseLogicalPlan(Dual, b.allocator),
+	}
+	dual.self = dual
+	for _, astExpr := range v.Exprs {
+		expr, _, err := b.rewrite(astExpr, dual, nil, true)
+		if err != nil {
+			b.err = errors.Trace(err)
+			return nil
+		}
+		exprs = append(exprs, expr)
+	}
+	p := &Projection{
+		Exprs:           exprs,
+		baseLogicalPlan: newBaseLogicalPlan(Proj, b.allocator),
+	}
+	p.initIDAndContext(b.ctx)
+	addChild(p, dual)
+	p.self = p
+	return p
+}
+
+func (b *planBuilder) buildSet(v *ast.SetStmt) Plan {
+	p := &Set{}
+	p.tp = St
+	p.allocator = b.allocator
+	for _, vars := range v.Variables {
+		assign := &expression.VarAssignment{
+			Name:     vars.Name,
+			IsGlobal: vars.IsGlobal,
+			IsSystem: vars.IsSystem,
+		}
+		if _, ok := vars.Value.(*ast.DefaultExpr); !ok {
+			assign.Expr, _, b.err = b.rewrite(vars.Value, nil, nil, true)
+			if b.err != nil {
+				return nil
+			}
+		} else {
+			assign.IsDefault = true
+		}
+		if vars.ExtendValue != nil {
+			assign.ExtendValue = &expression.Constant{
+				Value:   vars.ExtendValue.Datum,
+				RetType: &vars.ExtendValue.Type,
+			}
+		}
+		p.VarAssigns = append(p.VarAssigns, assign)
+	}
+	p.initIDAndContext(b.ctx)
+	return p
 }
 
 // Detect aggregate function or groupby clause.
@@ -155,7 +206,7 @@ func (b *planBuilder) extractSelectAgg(sel *ast.SelectStmt) []*ast.AggregateFunc
 	for _, f := range sel.GetResultFields() {
 		n, ok := f.Expr.Accept(extractor)
 		if !ok {
-			b.err = errors.New("Failed to extract agg expr!")
+			b.err = errors.New("failed to extract agg expr")
 			return nil
 		}
 		ve, ok := f.Expr.(*ast.ValueExpr)
@@ -206,8 +257,14 @@ func availableIndices(table *ast.TableName) (indices []*model.IndexInfo, include
 			usableHints = append(usableHints, hint)
 		}
 	}
+	publicIndices := make([]*model.IndexInfo, 0, len(table.TableInfo.Indices))
+	for _, index := range table.TableInfo.Indices {
+		if index.State == model.StatePublic {
+			publicIndices = append(publicIndices, index)
+		}
+	}
 	if len(usableHints) == 0 {
-		return table.TableInfo.Indices, true
+		return publicIndices, true
 	}
 	var hasUse bool
 	var ignores []*model.IndexInfo
@@ -217,7 +274,7 @@ func availableIndices(table *ast.TableName) (indices []*model.IndexInfo, include
 			// Currently we don't distinguish between Force and Use because our cost estimation is not reliable.
 			hasUse = true
 			for _, idxName := range hint.IndexNames {
-				idx := findIndexByName(table.TableInfo.Indices, idxName)
+				idx := findIndexByName(publicIndices, idxName)
 				if idx != nil {
 					indices = append(indices, idx)
 				}
@@ -225,7 +282,7 @@ func availableIndices(table *ast.TableName) (indices []*model.IndexInfo, include
 		case ast.HintIgnore:
 			// Collect all the ignore index hints.
 			for _, idxName := range hint.IndexNames {
-				idx := findIndexByName(table.TableInfo.Indices, idxName)
+				idx := findIndexByName(publicIndices, idxName)
 				if idx != nil {
 					ignores = append(ignores, idx)
 				}
@@ -241,16 +298,7 @@ func availableIndices(table *ast.TableName) (indices []*model.IndexInfo, include
 		// Empty use hint means don't use any index.
 		return nil, true
 	}
-	if len(ignores) == 0 {
-		return table.TableInfo.Indices, true
-	}
-	for _, idx := range table.TableInfo.Indices {
-		// Exclude ignored index.
-		if findIndexByName(ignores, idx.Name) == nil {
-			indices = append(indices, idx)
-		}
-	}
-	return indices, true
+	return removeIgnores(publicIndices, ignores), true
 }
 
 func removeIgnores(indices, ignores []*model.IndexInfo) []*model.IndexInfo {
@@ -281,10 +329,9 @@ func (b *planBuilder) buildSelectLock(src Plan, lock ast.SelectLockType) *Select
 		baseLogicalPlan: newBaseLogicalPlan(Lock, b.allocator),
 	}
 	selectLock.self = selectLock
-	selectLock.initID()
+	selectLock.initIDAndContext(b.ctx)
 	addChild(selectLock, src)
 	selectLock.SetSchema(src.GetSchema())
-	selectLock.SetFields(src.Fields())
 	return selectLock
 }
 
@@ -308,7 +355,7 @@ func (b *planBuilder) buildAdmin(as *ast.AdminStmt) Plan {
 		p = &CheckTable{Tables: as.Tables}
 	case ast.AdminShowDDL:
 		p = &ShowDDL{}
-		p.SetFields(buildShowDDLFields())
+		p.SetSchema(buildShowDDLFields())
 	default:
 		b.err = ErrUnsupportedType.Gen("Unsupported type %T", as)
 	}
@@ -316,19 +363,19 @@ func (b *planBuilder) buildAdmin(as *ast.AdminStmt) Plan {
 	return p
 }
 
-func buildShowDDLFields() []*ast.ResultField {
-	rfs := make([]*ast.ResultField, 0, 6)
-	rfs = append(rfs, buildResultField("", "SCHEMA_VER", mysql.TypeLonglong, 4))
-	rfs = append(rfs, buildResultField("", "OWNER", mysql.TypeVarchar, 64))
-	rfs = append(rfs, buildResultField("", "JOB", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField("", "BG_SCHEMA_VER", mysql.TypeLonglong, 4))
-	rfs = append(rfs, buildResultField("", "BG_OWNER", mysql.TypeVarchar, 64))
-	rfs = append(rfs, buildResultField("", "BG_JOB", mysql.TypeVarchar, 128))
+func buildShowDDLFields() expression.Schema {
+	schema := make(expression.Schema, 0, 6)
+	schema = append(schema, buildColumn("", "SCHEMA_VER", mysql.TypeLonglong, 4))
+	schema = append(schema, buildColumn("", "OWNER", mysql.TypeVarchar, 64))
+	schema = append(schema, buildColumn("", "JOB", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn("", "BG_SCHEMA_VER", mysql.TypeLonglong, 4))
+	schema = append(schema, buildColumn("", "BG_OWNER", mysql.TypeVarchar, 64))
+	schema = append(schema, buildColumn("", "BG_JOB", mysql.TypeVarchar, 128))
 
-	return rfs
+	return schema
 }
 
-func buildResultField(tableName, name string, tp byte, size int) *ast.ResultField {
+func buildColumn(tableName, name string, tp byte, size int) *expression.Column {
 	cs := charset.CharsetBin
 	cl := charset.CharsetBin
 	flag := mysql.UnsignedFlag
@@ -338,26 +385,18 @@ func buildResultField(tableName, name string, tp byte, size int) *ast.ResultFiel
 		flag = 0
 	}
 
-	fieldType := types.FieldType{
+	fieldType := &types.FieldType{
 		Charset: cs,
 		Collate: cl,
 		Tp:      tp,
 		Flen:    size,
 		Flag:    uint(flag),
 	}
-	colInfo := &model.ColumnInfo{
-		Name:      model.NewCIStr(name),
-		FieldType: fieldType,
-	}
-	expr := &ast.ValueExpr{}
-	expr.SetType(&fieldType)
-
-	return &ast.ResultField{
-		Column:       colInfo,
-		ColumnAsName: colInfo.Name,
-		TableAsName:  model.NewCIStr(tableName),
-		DBName:       model.NewCIStr(infoschema.Name),
-		Expr:         expr,
+	return &expression.Column{
+		ColName: model.NewCIStr(name),
+		TblName: model.NewCIStr(tableName),
+		DBName:  model.NewCIStr(infoschema.Name),
+		RetType: fieldType,
 	}
 }
 
@@ -382,37 +421,64 @@ func splitWhere(where ast.ExprNode) []ast.ExprNode {
 }
 
 func (b *planBuilder) buildShow(show *ast.ShowStmt) Plan {
-	var p Plan
-	p = &Show{
-		Tp:     show.Tp,
-		DBName: show.DBName,
-		Table:  show.Table,
-		Column: show.Column,
-		Flag:   show.Flag,
-		Full:   show.Full,
-		User:   show.User,
+	var resultPlan Plan
+	p := &Show{
+		Tp:              show.Tp,
+		DBName:          show.DBName,
+		Table:           show.Table,
+		Column:          show.Column,
+		Flag:            show.Flag,
+		Full:            show.Full,
+		User:            show.User,
+		baseLogicalPlan: newBaseLogicalPlan("Show", b.allocator),
 	}
+	resultPlan = p
+	p.initIDAndContext(b.ctx)
+	p.self = p
 	switch show.Tp {
 	case ast.ShowProcedureStatus:
-		p.SetFields(buildShowProcedureFields())
+		p.SetSchema(buildShowProcedureSchema())
 	case ast.ShowTriggers:
-		p.SetFields(buildShowTriggerFields())
+		p.SetSchema(buildShowTriggerSchema())
+	case ast.ShowEvents:
+		p.SetSchema(buildShowEventsSchema())
 	default:
-		p.SetFields(show.GetResultFields())
+		p.SetSchema(expression.ResultFieldsToSchema(show.GetResultFields()))
 	}
-	var conditions []ast.ExprNode
+	for i, col := range p.schema {
+		col.Position = i
+	}
+	var conditions []expression.Expression
 	if show.Pattern != nil {
-		conditions = append(conditions, show.Pattern)
+		expr, _, err := b.rewrite(show.Pattern, p, nil, false)
+		if err != nil {
+			b.err = errors.Trace(err)
+			return nil
+		}
+		conditions = append(conditions, expr)
 	}
 	if show.Where != nil {
-		conditions = append(conditions, show.Where)
+		conds := splitWhere(show.Where)
+		for _, cond := range conds {
+			expr, _, err := b.rewrite(cond, p, nil, false)
+			if err != nil {
+				b.err = errors.Trace(err)
+				return nil
+			}
+			conditions = append(conditions, expr)
+		}
 	}
 	if len(conditions) != 0 {
-		filter := &Filter{Conditions: conditions}
-		addChild(filter, p)
-		p = filter
+		sel := &Selection{
+			baseLogicalPlan: newBaseLogicalPlan(Sel, b.allocator),
+			Conditions:      conditions,
+		}
+		sel.initIDAndContext(b.ctx)
+		sel.self = sel
+		addChild(sel, p)
+		resultPlan = sel
 	}
-	return p
+	return resultPlan
 }
 
 func (b *planBuilder) buildSimple(node ast.StmtNode) Plan {
@@ -431,7 +497,7 @@ func (b *planBuilder) buildInsert(insert *ast.InsertStmt) Plan {
 		Ignore:          insert.Ignore,
 		baseLogicalPlan: newBaseLogicalPlan(Ins, b.allocator),
 	}
-	insertPlan.initID()
+	insertPlan.initIDAndContext(b.ctx)
 	insertPlan.self = insertPlan
 	if insert.Select != nil {
 		selectPlan := b.build(insert.Select)
@@ -462,68 +528,81 @@ func (b *planBuilder) buildExplain(explain *ast.ExplainStmt) Plan {
 	if show, ok := explain.Stmt.(*ast.ShowStmt); ok {
 		return b.buildShow(show)
 	}
-	targetPlan := b.build(explain.Stmt)
-	if b.err != nil {
+	targetPlan, err := Optimize(b.ctx, explain.Stmt, b.is)
+	if err != nil {
+		b.err = errors.Trace(err)
 		return nil
-	}
-	if logic, ok := targetPlan.(LogicalPlan); ok {
-		var err error
-		_, logic, err = logic.PredicatePushDown(nil)
-		if err != nil {
-			b.err = errors.Trace(err)
-			return nil
-		}
-		_, err = logic.PruneColumnsAndResolveIndices(logic.GetSchema())
-		if err != nil {
-			b.err = errors.Trace(err)
-			return nil
-		}
-		info, err := logic.convert2PhysicalPlan(&requiredProperty{})
-		if err != nil {
-			b.err = errors.Trace(err)
-			return nil
-		}
-		targetPlan = info.p
 	}
 	p := &Explain{StmtPlan: targetPlan}
 	addChild(p, targetPlan)
-	col := &expression.Column{
+	schema := make(expression.Schema, 0, 3)
+	schema = append(schema, &expression.Column{
+		ColName: model.NewCIStr("ID"),
 		RetType: types.NewFieldType(mysql.TypeString),
-	}
-	p.SetSchema([]*expression.Column{col, col})
+	})
+	schema = append(schema, &expression.Column{
+		ColName: model.NewCIStr("Json"),
+		RetType: types.NewFieldType(mysql.TypeString),
+	})
+	schema = append(schema, &expression.Column{
+		ColName: model.NewCIStr("ParentID"),
+		RetType: types.NewFieldType(mysql.TypeString),
+	})
+	p.SetSchema(schema)
 	return p
 }
 
-func buildShowProcedureFields() []*ast.ResultField {
+func buildShowProcedureSchema() expression.Schema {
 	tblName := "ROUTINES"
-	rfs := make([]*ast.ResultField, 0, 11)
-	rfs = append(rfs, buildResultField(tblName, "Db", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Name", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Type", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Definer", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Modified", mysql.TypeDatetime, 19))
-	rfs = append(rfs, buildResultField(tblName, "Created", mysql.TypeDatetime, 19))
-	rfs = append(rfs, buildResultField(tblName, "Security_type", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Comment", mysql.TypeBlob, 196605))
-	rfs = append(rfs, buildResultField(tblName, "character_set_client", mysql.TypeVarchar, 32))
-	rfs = append(rfs, buildResultField(tblName, "collation_connection", mysql.TypeVarchar, 32))
-	rfs = append(rfs, buildResultField(tblName, "Database Collation", mysql.TypeVarchar, 32))
-	return rfs
+	schema := make(expression.Schema, 0, 11)
+	schema = append(schema, buildColumn(tblName, "Db", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Name", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Type", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Definer", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Modified", mysql.TypeDatetime, 19))
+	schema = append(schema, buildColumn(tblName, "Created", mysql.TypeDatetime, 19))
+	schema = append(schema, buildColumn(tblName, "Security_type", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Comment", mysql.TypeBlob, 196605))
+	schema = append(schema, buildColumn(tblName, "character_set_client", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "collation_connection", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "Database Collation", mysql.TypeVarchar, 32))
+	return schema
 }
 
-func buildShowTriggerFields() []*ast.ResultField {
+func buildShowTriggerSchema() expression.Schema {
 	tblName := "TRIGGERS"
-	rfs := make([]*ast.ResultField, 0, 11)
-	rfs = append(rfs, buildResultField(tblName, "Trigger", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Event", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Table", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Statement", mysql.TypeBlob, 196605))
-	rfs = append(rfs, buildResultField(tblName, "Timing", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "Created", mysql.TypeDatetime, 19))
-	rfs = append(rfs, buildResultField(tblName, "sql_mode", mysql.TypeBlob, 8192))
-	rfs = append(rfs, buildResultField(tblName, "Definer", mysql.TypeVarchar, 128))
-	rfs = append(rfs, buildResultField(tblName, "character_set_client", mysql.TypeVarchar, 32))
-	rfs = append(rfs, buildResultField(tblName, "collation_connection", mysql.TypeVarchar, 32))
-	rfs = append(rfs, buildResultField(tblName, "Database Collation", mysql.TypeVarchar, 32))
-	return rfs
+	schema := make(expression.Schema, 0, 11)
+	schema = append(schema, buildColumn(tblName, "Trigger", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Event", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Table", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Statement", mysql.TypeBlob, 196605))
+	schema = append(schema, buildColumn(tblName, "Timing", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Created", mysql.TypeDatetime, 19))
+	schema = append(schema, buildColumn(tblName, "sql_mode", mysql.TypeBlob, 8192))
+	schema = append(schema, buildColumn(tblName, "Definer", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "character_set_client", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "collation_connection", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "Database Collation", mysql.TypeVarchar, 32))
+	return schema
+}
+
+func buildShowEventsSchema() expression.Schema {
+	tblName := "EVENTS"
+	schema := make(expression.Schema, 0, 15)
+	schema = append(schema, buildColumn(tblName, "Db", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Name", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Time zone", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "Definer", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Type", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Execute At", mysql.TypeDatetime, 19))
+	schema = append(schema, buildColumn(tblName, "Interval Value", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Interval Field", mysql.TypeVarchar, 128))
+	schema = append(schema, buildColumn(tblName, "Starts", mysql.TypeDatetime, 19))
+	schema = append(schema, buildColumn(tblName, "Ends", mysql.TypeDatetime, 19))
+	schema = append(schema, buildColumn(tblName, "Status", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "Originator", mysql.TypeInt24, 4))
+	schema = append(schema, buildColumn(tblName, "character_set_client", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "collation_connection", mysql.TypeVarchar, 32))
+	schema = append(schema, buildColumn(tblName, "Database Collation", mysql.TypeVarchar, 32))
+	return schema
 }

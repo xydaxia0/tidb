@@ -165,8 +165,8 @@ func (c *index) Create(rm kv.RetrieverMutator, indexedValues []types.Datum, h in
 		return 0, errors.Trace(err)
 	}
 	if !distinct {
-		// TODO: reconsider value
-		err = rm.Set(key, []byte("timestamp?"))
+		// non-unique index doesn't need store value, write a '0' to reduce space
+		err = rm.Set(key, []byte{'0'})
 		return 0, errors.Trace(err)
 	}
 
@@ -278,8 +278,9 @@ func (c *index) Exist(rm kv.RetrieverMutator, indexedValues []types.Datum, h int
 func (c *index) FetchValues(r []types.Datum) ([]types.Datum, error) {
 	vals := make([]types.Datum, len(c.idxInfo.Columns))
 	for i, ic := range c.idxInfo.Columns {
-		if ic.Offset < 0 || ic.Offset > len(r) {
-			return nil, table.ErrIndexOutBound.Gen("Index column offset out of bound")
+		if ic.Offset < 0 || ic.Offset >= len(r) {
+			return nil, table.ErrIndexOutBound.Gen("Index column %s offset out of bound, offset: %d, row: %v",
+				ic.Name, ic.Offset, r)
 		}
 		vals[i] = r[ic.Offset]
 	}

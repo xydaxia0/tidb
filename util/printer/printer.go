@@ -15,6 +15,7 @@ package printer
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/ngaut/log"
 )
@@ -27,10 +28,16 @@ var (
 
 // PrintTiDBInfo prints the TiDB version information.
 func PrintTiDBInfo() {
-	log.Infof("Welcome to the TiDB.")
+	log.Infof("Welcome to TiDB.")
 	log.Infof("Version:")
 	log.Infof("Git Commit Hash: %s", TiDBGitHash)
 	log.Infof("UTC Build Time:  %s", TiDBBuildTS)
+}
+
+// PrintRawTiDBInfo prints the TiDB version information without log info.
+func PrintRawTiDBInfo() {
+	fmt.Println("Git Commit Hash:", TiDBGitHash)
+	fmt.Println("UTC Build Time: ", TiDBBuildTS)
 }
 
 // checkValidity checks whether cols and every data have the same length.

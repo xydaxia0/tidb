@@ -14,16 +14,24 @@
 package distsql
 
 import (
+	"bytes"
+	"errors"
+	"io"
+	"io/ioutil"
+	"runtime"
 	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -42,4 +50,65 @@ func (s *testTableCodecSuite) TestColumnToProto(c *C) {
 	}
 	pc := columnToProto(col)
 	c.Assert(pc.GetFlag(), Equals, int32(10))
+}
+
+// For issue 1791
+func (s *testTableCodecSuite) TestGoroutineLeak(c *C) {
+	var sr SelectResult
+	countBefore := runtime.NumGoroutine()
+
+	sr = &selectResult{
+		resp:    &mockResponse{},
+		results: make(chan resultWithErr, 5),
+		closed:  make(chan struct{}),
+	}
+	go sr.Fetch()
+	for {
+		// mock test will generate some partial result then return error
+		_, err := sr.Next()
+		if err != nil {
+			// close selectResult on error, partialResult's fetch goroutine may leak
+			sr.Close()
+			break
+		}
+	}
+
+	tick := 10 * time.Millisecond
+	totalSleep := time.Duration(0)
+	for totalSleep < 3*time.Second {
+		time.Sleep(tick)
+		totalSleep += tick
+		countAfter := runtime.NumGoroutine()
+
+		if countAfter-countBefore < 5 {
+			return
+		}
+	}
+
+	c.Error("distsql goroutine leak!")
+}
+
+type mockResponse struct {
+	count int
+}
+
+func (resp *mockResponse) Next() (io.ReadCloser, error) {
+	resp.count++
+	if resp.count == 100 {
+		return nil, errors.New("error happend")
+	}
+	return mockReaderCloser(), nil
+}
+
+func (resp *mockResponse) Close() error {
+	return nil
+}
+
+func mockReaderCloser() io.ReadCloser {
+	resp := new(tipb.SelectResponse)
+	b, err := resp.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return ioutil.NopCloser(bytes.NewBuffer(b))
 }

@@ -17,6 +17,7 @@ import (
 	"fmt"
 
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/sessionctx/variable"
 )
 
 // Context is an interface for transaction and executive args environment.
@@ -41,6 +42,8 @@ type Context interface {
 
 	// ClearValue clears the value associated with this context for key.
 	ClearValue(key fmt.Stringer)
+
+	GetSessionVars() *variable.SessionVars
 }
 
 type basicCtxType int
@@ -49,6 +52,8 @@ func (t basicCtxType) String() string {
 	switch t {
 	case QueryString:
 		return "query_string"
+	case Initing:
+		return "initing"
 	}
 	return "unknown"
 }
@@ -57,4 +62,6 @@ func (t basicCtxType) String() string {
 const (
 	// QueryString is the key for original query string.
 	QueryString basicCtxType = 1
+	// Initing is the key for indicating if the server is running bootstrap or upgrad job.
+	Initing basicCtxType = 2
 )

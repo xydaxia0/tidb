@@ -18,6 +18,8 @@ import (
 	"strings"
 
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -32,7 +34,7 @@ type ShowDDL struct {
 	basePlan
 }
 
-// CheckTable is for checking table data.
+// CheckTable is used for checking table data, built from the 'admin check table' statement.
 type CheckTable struct {
 	basePlan
 
@@ -48,7 +50,7 @@ type IndexRange struct {
 }
 
 // IsPoint returns if the index range is a point.
-func (ir *IndexRange) IsPoint() bool {
+func (ir *IndexRange) IsPoint(sc *variable.StatementContext) bool {
 	if len(ir.LowVal) != len(ir.HighVal) {
 		return false
 	}
@@ -58,7 +60,7 @@ func (ir *IndexRange) IsPoint() bool {
 		if a.Kind() == types.KindMinNotNull || b.Kind() == types.KindMaxValue {
 			return false
 		}
-		cmp, err := a.CompareDatum(b)
+		cmp, err := a.CompareDatum(sc, b)
 		if err != nil {
 			return false
 		}
@@ -129,7 +131,7 @@ type Execute struct {
 	basePlan
 
 	Name      string
-	UsingVars []ast.ExprNode
+	UsingVars []expression.Expression
 	ID        uint32
 }
 
@@ -140,19 +142,9 @@ type Deallocate struct {
 	Name string
 }
 
-// Filter represents a plan that filter GetChildByIndex(0)plan result.
-type Filter struct {
-	basePlan
-
-	// Originally the WHERE or ON condition is parsed into a single expression,
-	// but after we converted to CNF(Conjunctive normal form), it can be
-	// split into a list of AND conditions.
-	Conditions []ast.ExprNode
-}
-
 // Show represents a show plan.
 type Show struct {
-	basePlan
+	baseLogicalPlan
 
 	Tp     ast.ShowStmtType // Databases/Tables/Columns/....
 	DBName string
@@ -164,6 +156,13 @@ type Show struct {
 
 	// Used by show variables
 	GlobalScope bool
+}
+
+// Set represents a plan for set stmt.
+type Set struct {
+	basePlan
+
+	VarAssigns []*expression.VarAssignment
 }
 
 // Simple represents a simple statement plan which doesn't need any optimization.

@@ -25,11 +25,14 @@ import (
 	"github.com/pingcap/kvproto/pkg/msgpb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/kvproto/pkg/util"
-	"github.com/pingcap/pd/pkg/metrics"
+	"github.com/pingcap/pd/pkg/metricutil"
 	"github.com/twinj/uuid"
 )
 
-const maxPipelineRequest = 10000
+const (
+	maxPipelineRequest    = 10000
+	maxInitClusterRetries = 300
+)
 
 // errInvalidResponse represents response message is invalid.
 var errInvalidResponse = errors.New("invalid response")
@@ -66,16 +69,21 @@ type rpcWorker struct {
 	quit      chan struct{}
 }
 
-func newRPCWorker(addrs []string, clusterID uint64) *rpcWorker {
+func newRPCWorker(addrs []string) (*rpcWorker, error) {
 	w := &rpcWorker{
-		urls:      addrsToUrls(addrs),
-		clusterID: clusterID,
-		requests:  make(chan interface{}, maxPipelineRequest),
-		quit:      make(chan struct{}),
+		urls:     addrsToUrls(addrs),
+		requests: make(chan interface{}, maxPipelineRequest),
+		quit:     make(chan struct{}),
 	}
+
+	if err := w.initClusterID(); err != nil {
+		return nil, errors.Trace(err)
+	}
+	log.Infof("[pd] init cluster id %v", w.clusterID)
+
 	w.wg.Add(1)
 	go w.work()
-	return w
+	return w, nil
 }
 
 func (w *rpcWorker) stop(err error) {
@@ -210,6 +218,50 @@ func newMsgID() uint64 {
 	return atomic.AddUint64(&msgID, 1)
 }
 
+func (w *rpcWorker) initClusterID() error {
+	for i := 0; i < maxInitClusterRetries; i++ {
+		conn := mustNewConn(w.urls, w.quit)
+		if conn == nil {
+			return errors.New("client closed")
+		}
+
+		clusterID, err := w.getClusterID(conn.ReadWriter)
+		// We need to close this connection no matter success or not.
+		conn.Close()
+
+		if err == nil {
+			w.clusterID = clusterID
+			return nil
+		}
+
+		log.Errorf("[pd] failed to get cluster id: %v", err)
+		time.Sleep(time.Second)
+	}
+
+	return errors.New("failed to get cluster id")
+}
+
+func (w *rpcWorker) getClusterID(conn *bufio.ReadWriter) (uint64, error) {
+	// PD will not check the cluster ID in the GetPDMembersRequest, so we
+	// can send this request with any cluster ID, then PD will return its
+	// cluster ID in the response header.
+	req := &pdpb.Request{
+		Header: &pdpb.RequestHeader{
+			Uuid:      uuid.NewV4().Bytes(),
+			ClusterId: w.clusterID,
+		},
+		CmdType:      pdpb.CommandType_GetPDMembers,
+		GetPdMembers: &pdpb.GetPDMembersRequest{},
+	}
+
+	resp, err := w.callRPC(conn, req)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	return resp.GetHeader().GetClusterId(), nil
+}
+
 func (w *rpcWorker) getTSFromRemote(conn *bufio.ReadWriter, n int) (pdpb.Timestamp, error) {
 	var timestampHigh = pdpb.Timestamp{}
 	req := &pdpb.Request{
@@ -296,7 +348,7 @@ func (w *rpcWorker) getClusterConfigFromRemote(conn *bufio.ReadWriter, clusterCo
 func (w *rpcWorker) callRPC(conn *bufio.ReadWriter, req *pdpb.Request) (resp *pdpb.Response, err error) {
 	// Record some metrics.
 	start := time.Now()
-	label := metrics.GetCmdLabel(req)
+	label := metricutil.GetCmdLabel(req)
 	defer func() {
 		if err == nil {
 			cmdCounter.WithLabelValues(label).Inc()

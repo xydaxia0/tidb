@@ -20,6 +20,7 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
@@ -39,7 +40,6 @@ type PhysicalIndexScan struct {
 	basePlan
 	physicalTableSource
 
-	readOnly   bool
 	Table      *model.TableInfo
 	Index      *model.IndexInfo
 	Ranges     []*IndexRange
@@ -51,9 +51,10 @@ type PhysicalIndexScan struct {
 	// If the query requires the columns that don't belong to index, DoubleRead will be true.
 	DoubleRead bool
 
+	// All conditions in AccessCondition[accessEqualCount:accessInAndEqCount] are IN expressions or equal conditions.
+	accessInAndEqCount int
+	// All conditions in AccessCondition[:accessEqualCount] are equal conditions.
 	accessEqualCount int
-	AccessCondition  []expression.Expression
-	conditions       []expression.Expression
 
 	TableAsName *model.CIStr
 }
@@ -61,31 +62,129 @@ type PhysicalIndexScan struct {
 // physicalDistSQLPlan means the plan that can be executed distributively.
 // We can push down other plan like selection, limit, aggregation, topn into this plan.
 type physicalDistSQLPlan interface {
-	addAggregation(agg *PhysicalAggregation) expression.Schema
-	addTopN(prop *requiredProperty) bool
+	addAggregation(ctx context.Context, agg *PhysicalAggregation) expression.Schema
+	addTopN(ctx context.Context, prop *requiredProperty) bool
 	addLimit(limit *Limit)
+	// scanCount means the original row count that need to be scanned and resultCount means the row count after scanning.
+	calculateCost(resultCount uint64, scanCount uint64) float64
+}
+
+func (p *PhysicalIndexScan) calculateCost(resultCount uint64, scanCount uint64) float64 {
+	// TODO: Eliminate index cost more precisely.
+	cost := float64(resultCount) * netWorkFactor
+	scanCnt := float64(scanCount)
+	if p.DoubleRead {
+		cost += scanCnt * netWorkFactor
+	}
+	if len(p.indexFilterConditions) > 0 {
+		cost += scanCnt * cpuFactor
+	}
+	if len(p.tableFilterConditions) > 0 {
+		cost += scanCnt * cpuFactor
+	}
+	// sort cost
+	if !p.OutOfOrder && p.DoubleRead {
+		cost += scanCnt * cpuFactor
+	}
+	return cost
+}
+
+func (p *PhysicalTableScan) calculateCost(resultCount uint64, scanCount uint64) float64 {
+	cost := float64(resultCount) * netWorkFactor
+	if len(p.tableFilterConditions) > 0 {
+		cost += float64(scanCount) * cpuFactor
+	}
+	return cost
 }
 
 type physicalTableSource struct {
 	client kv.Client
 
 	Aggregated bool
+	readOnly   bool
 	AggFields  []*types.FieldType
-	AggFuncs   []*tipb.Expr
-	GbyItems   []*tipb.ByItem
+	AggFuncsPB []*tipb.Expr
+	GbyItemsPB []*tipb.ByItem
 
-	// ConditionPBExpr is the pb structure of conditions that be pushed down.
-	ConditionPBExpr *tipb.Expr
+	// TableConditionPBExpr is the pb structure of conditions that used in the table scan.
+	TableConditionPBExpr *tipb.Expr
+	// IndexConditionPBExpr is the pb structure of conditions that used in the index scan.
+	IndexConditionPBExpr *tipb.Expr
 
-	LimitCount *int64
-	SortItems  []*tipb.ByItem
+	// AccessCondition is used to calculate range.
+	AccessCondition []expression.Expression
+
+	LimitCount  *int64
+	SortItemsPB []*tipb.ByItem
+
+	// The following fields are used for explaining and testing. Because pb structures are not human-readable.
+	aggFuncs              []expression.AggregationFunction
+	gbyItems              []expression.Expression
+	sortItems             []*ByItems
+	indexFilterConditions []expression.Expression
+	tableFilterConditions []expression.Expression
 }
 
-func (p *physicalTableSource) clear() {
+// MarshalJSON implements json.Marshaler interface.
+func (p *physicalTableSource) MarshalJSON() ([]byte, error) {
+	buffer := bytes.NewBufferString("{")
+	limit := 0
+	if p.LimitCount != nil {
+		limit = int(*p.LimitCount)
+	}
+	buffer.WriteString(fmt.Sprintf("\"limit\": %d, \n", limit))
+	if p.Aggregated {
+		buffer.WriteString(fmt.Sprint("\"aggregated push down\": true, \n"))
+		gbyItems, err := json.Marshal(p.gbyItems)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		buffer.WriteString(fmt.Sprintf("\"gby items\": %s, \n", gbyItems))
+		aggFuncs, err := json.Marshal(p.aggFuncs)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		buffer.WriteString(fmt.Sprintf("\"agg funcs\": %s, \n", aggFuncs))
+	} else if len(p.sortItems) > 0 {
+		sortItems, err := json.Marshal(p.sortItems)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		buffer.WriteString(fmt.Sprintf("\"sort items\": %s, \n", sortItems))
+	}
+	access, err := json.Marshal(p.AccessCondition)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	indexFilter, err := json.Marshal(p.indexFilterConditions)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	tableFilter, err := json.Marshal(p.tableFilterConditions)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	// print condition infos
+	buffer.WriteString(fmt.Sprintf("\"access conditions\": %s, \n", access))
+	buffer.WriteString(fmt.Sprintf("\"index filter conditions\": %s, \n", indexFilter))
+	buffer.WriteString(fmt.Sprintf("\"table filter conditions\": %s}", tableFilter))
+	return buffer.Bytes(), nil
+}
+
+func (p *physicalTableSource) clearForAggPushDown() {
 	p.AggFields = nil
-	p.AggFuncs = nil
-	p.GbyItems = nil
+	p.AggFuncsPB = nil
+	p.GbyItemsPB = nil
 	p.Aggregated = false
+
+	p.aggFuncs = nil
+	p.gbyItems = nil
+}
+
+func (p *physicalTableSource) clearForTopnPushDown() {
+	p.sortItems = nil
+	p.SortItemsPB = nil
+	p.LimitCount = nil
 }
 
 func needCount(af expression.AggregationFunction) bool {
@@ -97,6 +196,19 @@ func needValue(af expression.AggregationFunction) bool {
 		af.GetName() == ast.AggFuncMax || af.GetName() == ast.AggFuncMin || af.GetName() == ast.AggFuncGroupConcat
 }
 
+func (p *physicalTableSource) tryToAddUnionScan(resultPlan PhysicalPlan) PhysicalPlan {
+	if p.readOnly {
+		return resultPlan
+	}
+	conditions := append(p.indexFilterConditions, p.tableFilterConditions...)
+	us := &PhysicalUnionScan{
+		Condition: expression.ComposeCNFCondition(append(conditions, p.AccessCondition...)),
+	}
+	us.SetChildren(resultPlan)
+	us.SetSchema(resultPlan.GetSchema())
+	return us
+}
+
 func (p *physicalTableSource) addLimit(l *Limit) {
 	if l != nil {
 		count := int64(l.Count + l.Offset)
@@ -104,40 +216,57 @@ func (p *physicalTableSource) addLimit(l *Limit) {
 	}
 }
 
-func (p *physicalTableSource) addTopN(prop *requiredProperty) bool {
+func (p *physicalTableSource) addTopN(ctx context.Context, prop *requiredProperty) bool {
+	if len(prop.props) == 0 && prop.limit != nil {
+		p.addLimit(prop.limit)
+		return true
+	}
 	if p.client == nil || !p.client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeTopN) {
 		return false
 	}
-	if prop.limit == nil || len(prop.props) == 0 {
+	if prop.limit == nil {
 		return false
 	}
+	sc := ctx.GetSessionVars().StmtCtx
 	count := int64(prop.limit.Count + prop.limit.Offset)
 	p.LimitCount = &count
-	for _, item := range prop.props {
-		p.SortItems = append(p.SortItems, sortByItemToPB(p.client, item.col, item.desc))
+	for _, prop := range prop.props {
+		item := sortByItemToPB(sc, p.client, prop.col, prop.desc)
+		if item == nil {
+			// When we fail to convert any sortItem to PB struct, we should clear the environments.
+			p.clearForTopnPushDown()
+			return false
+		}
+		p.SortItemsPB = append(p.SortItemsPB, item)
+		p.sortItems = append(p.sortItems, &ByItems{Expr: prop.col, Desc: prop.desc})
 	}
 	return true
 }
 
-func (p *physicalTableSource) addAggregation(agg *PhysicalAggregation) expression.Schema {
+func (p *physicalTableSource) addAggregation(ctx context.Context, agg *PhysicalAggregation) expression.Schema {
 	if p.client == nil {
 		return nil
 	}
+	sc := ctx.GetSessionVars().StmtCtx
 	for _, f := range agg.AggFuncs {
-		pb := aggFuncToPBExpr(p.client, f)
+		pb := aggFuncToPBExpr(sc, p.client, f)
 		if pb == nil {
-			p.clear()
+			// When we fail to convert any agg function to PB struct, we should clear the environments.
+			p.clearForAggPushDown()
 			return nil
 		}
-		p.AggFuncs = append(p.AggFuncs, pb)
+		p.AggFuncsPB = append(p.AggFuncsPB, pb)
+		p.aggFuncs = append(p.aggFuncs, f.Clone())
 	}
 	for _, item := range agg.GroupByItems {
-		pb := groupByItemToPB(p.client, item)
+		pb := groupByItemToPB(sc, p.client, item)
 		if pb == nil {
-			p.clear()
+			// When we fail to convert any group-by item to PB struct, we should clear the environments.
+			p.clearForAggPushDown()
 			return nil
 		}
-		p.GbyItems = append(p.GbyItems, pb)
+		p.GbyItemsPB = append(p.GbyItemsPB, pb)
+		p.gbyItems = append(p.gbyItems, item.Clone())
 	}
 	p.Aggregated = true
 	gk := types.NewFieldType(mysql.TypeBlob)
@@ -146,15 +275,16 @@ func (p *physicalTableSource) addAggregation(agg *PhysicalAggregation) expressio
 	p.AggFields = append(p.AggFields, gk)
 	var schema expression.Schema
 	cursor := 0
-	schema = append(schema, &expression.Column{Index: cursor})
+	schema = append(schema, &expression.Column{Index: cursor, ColName: model.NewCIStr(fmt.Sprint(agg.GroupByItems))})
 	agg.GroupByItems = []expression.Expression{schema[cursor]}
 	newAggFuncs := make([]expression.AggregationFunction, len(agg.AggFuncs))
 	for i, aggFun := range agg.AggFuncs {
 		fun := expression.NewAggFunction(aggFun.GetName(), nil, false)
 		var args []expression.Expression
+		colName := model.NewCIStr(fmt.Sprint(aggFun.GetArgs()))
 		if needCount(fun) {
 			cursor++
-			schema = append(schema, &expression.Column{Index: cursor})
+			schema = append(schema, &expression.Column{Index: cursor, ColName: colName})
 			args = append(args, schema[cursor])
 			ft := types.NewFieldType(mysql.TypeLonglong)
 			ft.Flen = 21
@@ -164,7 +294,7 @@ func (p *physicalTableSource) addAggregation(agg *PhysicalAggregation) expressio
 		}
 		if needValue(fun) {
 			cursor++
-			schema = append(schema, &expression.Column{Index: cursor})
+			schema = append(schema, &expression.Column{Index: cursor, ColName: colName})
 			args = append(args, schema[cursor])
 			p.AggFields = append(p.AggFields, agg.schema[i].GetType())
 		}
@@ -181,16 +311,12 @@ type PhysicalTableScan struct {
 	basePlan
 	physicalTableSource
 
-	readOnly bool
-	Table    *model.TableInfo
-	Columns  []*model.ColumnInfo
-	DBName   *model.CIStr
-	Desc     bool
-	Ranges   []TableRange
-	pkCol    *expression.Column
-
-	AccessCondition []expression.Expression
-	conditions      []expression.Expression
+	Table   *model.TableInfo
+	Columns []*model.ColumnInfo
+	DBName  *model.CIStr
+	Desc    bool
+	Ranges  []TableRange
+	pkCol   *expression.Column
 
 	TableAsName *model.CIStr
 
@@ -207,8 +333,7 @@ type PhysicalDummyScan struct {
 type PhysicalApply struct {
 	basePlan
 
-	InnerPlan   PhysicalPlan
-	OuterSchema expression.Schema
+	OuterSchema []*expression.CorrelatedColumn
 	Checker     *ApplyConditionChecker
 }
 
@@ -224,6 +349,8 @@ type PhysicalHashJoin struct {
 	OtherConditions []expression.Expression
 	SmallTable      int
 	Concurrency     int
+
+	DefaultValues []types.Datum
 }
 
 // PhysicalHashSemiJoin represents hash join for semi join.
@@ -268,6 +395,11 @@ type PhysicalUnionScan struct {
 	Condition expression.Expression
 }
 
+// Cache plan is a physical plan which stores the result of its child node.
+type Cache struct {
+	basePlan
+}
+
 // Copy implements the PhysicalPlan Copy interface.
 func (p *PhysicalIndexScan) Copy() PhysicalPlan {
 	np := *p
@@ -276,26 +408,21 @@ func (p *PhysicalIndexScan) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *PhysicalIndexScan) MarshalJSON() ([]byte, error) {
-	limit := 0
-	if p.LimitCount != nil {
-		limit = int(*p.LimitCount)
-	}
-	access, err := json.Marshal(p.AccessCondition)
+	pushDownInfo, err := json.Marshal(&p.physicalTableSource)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"IndexScan\",\n"+
+	buffer.WriteString(fmt.Sprintf(
 		"\"db\": \"%s\","+
-		"\n \"table\": \"%s\","+
-		"\n \"index\": \"%s\","+
-		"\n \"ranges\": \"%s\","+
-		"\n \"desc\": %v,"+
-		"\n \"out of order\": %v,"+
-		"\n \"double read\": %v,"+
-		"\n \"access condition\": %s,"+
-		"\n \"limit\": %d\n}",
-		p.DBName.O, p.Table.Name.O, p.Index.Name.O, p.Ranges, p.Desc, p.OutOfOrder, p.DoubleRead, access, limit))
+			"\n \"table\": \"%s\","+
+			"\n \"index\": \"%s\","+
+			"\n \"ranges\": \"%s\","+
+			"\n \"desc\": %v,"+
+			"\n \"out of order\": %v,"+
+			"\n \"double read\": %v,"+
+			"\n \"push down info\": %s\n}",
+		p.DBName.O, p.Table.Name.O, p.Index.Name.O, p.Ranges, p.Desc, p.OutOfOrder, p.DoubleRead, pushDownInfo))
 	return buffer.Bytes(), nil
 }
 
@@ -307,23 +434,18 @@ func (p *PhysicalTableScan) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *PhysicalTableScan) MarshalJSON() ([]byte, error) {
-	limit := 0
-	if p.LimitCount != nil {
-		limit = int(*p.LimitCount)
-	}
-	access, err := json.Marshal(p.AccessCondition)
+	pushDownInfo, err := json.Marshal(&p.physicalTableSource)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"TableScan\",\n"+
+	buffer.WriteString(fmt.Sprintf(
 		" \"db\": \"%s\","+
-		"\n \"table\": \"%s\","+
-		"\n \"desc\": %v,"+
-		"\n \"keep order\": %v,"+
-		"\n \"access condition\": %s,"+
-		"\n \"limit\": %d}",
-		p.DBName.O, p.Table.Name.O, p.Desc, p.KeepOrder, access, limit))
+			"\n \"table\": \"%s\","+
+			"\n \"desc\": %v,"+
+			"\n \"keep order\": %v,"+
+			"\n \"push down info\": %s}",
+		p.DBName.O, p.Table.Name.O, p.Desc, p.KeepOrder, pushDownInfo))
 	return buffer.Bytes(), nil
 }
 
@@ -335,20 +457,15 @@ func (p *PhysicalApply) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *PhysicalApply) MarshalJSON() ([]byte, error) {
-	innerPlan, err := json.Marshal(p.InnerPlan.(PhysicalPlan))
+	checker, err := json.Marshal(p.Checker)
 	if err != nil {
 		return nil, errors.Trace(err)
-	}
-	outerPlan, err := json.Marshal(p.children[0].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	cond := "null"
-	if p.Checker != nil {
-		cond = "\"" + p.Checker.Condition.String() + "\""
 	}
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"Apply\",\"innerPlan\": %v,\n \"outerPlan\": %v,\n \"condition\": %s\n}", innerPlan, outerPlan, cond))
+	buffer.WriteString(fmt.Sprintf(
+		"\"innerPlan\": \"%s\",\n "+
+			"\"outerPlan\": \"%s\",\n "+
+			"\"condition\": %s\n}", p.children[1].GetID(), p.children[0].GetID(), checker))
 	return buffer.Bytes(), nil
 }
 
@@ -360,14 +477,8 @@ func (p *PhysicalHashSemiJoin) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *PhysicalHashSemiJoin) MarshalJSON() ([]byte, error) {
-	leftChild, err := json.Marshal(p.children[0].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	rightChild, err := json.Marshal(p.children[1].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
+	leftChild := p.children[0].(PhysicalPlan)
+	rightChild := p.children[1].(PhysicalPlan)
 	eqConds, err := json.Marshal(p.EqualConditions)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -386,17 +497,16 @@ func (p *PhysicalHashSemiJoin) MarshalJSON() ([]byte, error) {
 	}
 	buffer := bytes.NewBufferString("{")
 	buffer.WriteString(fmt.Sprintf(
-		"\"type\": \"SemiJoin\",\n "+
-			"\"with aux\": %v,"+
+		"\"with aux\": %v,"+
 			"\"anti\": %v,"+
 			"\"eqCond\": %s,\n "+
 			"\"leftCond\": %s,\n "+
 			"\"rightCond\": %s,\n "+
 			"\"otherCond\": %s,\n"+
-			"\"leftPlan\": %s,\n "+
-			"\"rightPlan\": %s"+
+			"\"leftPlan\": \"%s\",\n "+
+			"\"rightPlan\": \"%s\""+
 			"}",
-		p.WithAux, p.Anti, eqConds, leftConds, rightConds, otherConds, leftChild, rightChild))
+		p.WithAux, p.Anti, eqConds, leftConds, rightConds, otherConds, leftChild.GetID(), rightChild.GetID()))
 	return buffer.Bytes(), nil
 }
 
@@ -408,20 +518,8 @@ func (p *PhysicalHashJoin) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *PhysicalHashJoin) MarshalJSON() ([]byte, error) {
-	leftChild, err := json.Marshal(p.children[0].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	rightChild, err := json.Marshal(p.children[1].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	tp := "InnerJoin"
-	if p.JoinType == LeftOuterJoin {
-		tp = "LeftJoin"
-	} else if p.JoinType == RightOuterJoin {
-		tp = "RightJoin"
-	}
+	leftChild := p.children[0].(PhysicalPlan)
+	rightChild := p.children[1].(PhysicalPlan)
 	eqConds, err := json.Marshal(p.EqualConditions)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -440,15 +538,14 @@ func (p *PhysicalHashJoin) MarshalJSON() ([]byte, error) {
 	}
 	buffer := bytes.NewBufferString("{")
 	buffer.WriteString(fmt.Sprintf(
-		"\"type\": \"%s\",\n "+
-			"\"eqCond\": %s,\n "+
+		"\"eqCond\": %s,\n "+
 			"\"leftCond\": %s,\n "+
 			"\"rightCond\": %s,\n "+
 			"\"otherCond\": %s,\n"+
-			"\"leftPlan\": %s,\n "+
-			"\"rightPlan\": %s"+
+			"\"leftPlan\": \"%s\",\n "+
+			"\"rightPlan\": \"%s\""+
 			"}",
-		tp, eqConds, leftConds, rightConds, otherConds, leftChild, rightChild))
+		eqConds, leftConds, rightConds, otherConds, leftChild.GetID(), rightChild.GetID()))
 	return buffer.Bytes(), nil
 }
 
@@ -466,18 +563,14 @@ func (p *Selection) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *Selection) MarshalJSON() ([]byte, error) {
-	child, err := json.Marshal(p.children[0].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
 	conds, err := json.Marshal(p.Conditions)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"Selection\",\n"+
+	buffer.WriteString(fmt.Sprintf(""+
 		" \"condition\": %s,\n"+
-		" \"child\": %s\n}", conds, child))
+		" \"child\": \"%s\"\n}", conds, p.children[0].GetID()))
 	return buffer.Bytes(), nil
 }
 
@@ -489,18 +582,14 @@ func (p *Projection) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *Projection) MarshalJSON() ([]byte, error) {
-	child, err := json.Marshal(p.children[0].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
 	exprs, err := json.Marshal(p.Exprs)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"Projection\",\n"+
+	buffer.WriteString(fmt.Sprintf(
 		" \"exprs\": %s,\n"+
-		" \"child\": %s\n}", exprs, child))
+			" \"child\": \"%s\"\n}", exprs, p.children[0].GetID()))
 	return buffer.Bytes(), nil
 }
 
@@ -530,19 +619,12 @@ func (p *Limit) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *Limit) MarshalJSON() ([]byte, error) {
-	var child PhysicalPlan
-	if len(p.children) > 0 {
-		child = p.children[0].(PhysicalPlan)
-	}
-	childStr, err := json.Marshal(child)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
+	child := p.children[0].(PhysicalPlan)
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"Limit\",\n"+
+	buffer.WriteString(fmt.Sprintf(
 		" \"limit\": %d,\n"+
-		" \"offset\": %d,\n"+
-		" \"child\": %s}", p.Count, p.Offset, childStr))
+			" \"offset\": %d,\n"+
+			" \"child\": \"%s\"}", p.Count, p.Offset, child.GetID()))
 	return buffer.Bytes(), nil
 }
 
@@ -560,23 +642,22 @@ func (p *Sort) Copy() PhysicalPlan {
 
 // MarshalJSON implements json.Marshaler interface.
 func (p *Sort) MarshalJSON() ([]byte, error) {
-	child, err := json.Marshal(p.children[0].(PhysicalPlan))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	limit, err := json.Marshal(p.ExecLimit)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
 	exprs, err := json.Marshal(p.ByItems)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	limitCount := []byte("null")
+	if p.ExecLimit != nil {
+		limitCount, err = json.Marshal(p.ExecLimit.Count)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
 	buffer := bytes.NewBufferString("{")
-	buffer.WriteString(fmt.Sprintf("\"type\": \"Sort\",\n"+
+	buffer.WriteString(fmt.Sprintf(
 		" \"exprs\": %s,\n"+
-		" \"limit\": %s,\n"+
-		" \"child\": %s}", exprs, limit, child))
+			" \"limit\": %s,\n"+
+			" \"child\": \"%s\"}", exprs, limitCount, p.children[0].GetID()))
 	return buffer.Bytes(), nil
 }
 
@@ -604,6 +685,24 @@ func (p *PhysicalAggregation) Copy() PhysicalPlan {
 	return &np
 }
 
+// MarshalJSON implements json.Marshaler interface.
+func (p *PhysicalAggregation) MarshalJSON() ([]byte, error) {
+	buffer := bytes.NewBufferString("{")
+	aggFuncs, err := json.Marshal(p.AggFuncs)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	gbyExprs, err := json.Marshal(p.GroupByItems)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	buffer.WriteString(fmt.Sprintf(
+		"\"AggFuncs\": %s,\n"+
+			"\"GroupByItems\": %s,\n"+
+			"\"child\": \"%s\"}", aggFuncs, gbyExprs, p.children[0].GetID()))
+	return buffer.Bytes(), nil
+}
+
 // Copy implements the PhysicalPlan Copy interface.
 func (p *Update) Copy() PhysicalPlan {
 	np := *p
@@ -623,7 +722,19 @@ func (p *Delete) Copy() PhysicalPlan {
 }
 
 // Copy implements the PhysicalPlan Copy interface.
+func (p *Show) Copy() PhysicalPlan {
+	np := *p
+	return &np
+}
+
+// Copy implements the PhysicalPlan Copy interface.
 func (p *PhysicalUnionScan) Copy() PhysicalPlan {
+	np := *p
+	return &np
+}
+
+// Copy implements the PhysicalPlan Copy interface.
+func (p *Cache) Copy() PhysicalPlan {
 	np := *p
 	return &np
 }

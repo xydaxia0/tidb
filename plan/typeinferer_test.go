@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
@@ -113,10 +114,13 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		{"found_rows()", mysql.TypeLonglong, charset.CharsetBin},
 		{"length('tidb')", mysql.TypeLonglong, charset.CharsetBin},
 		{"now()", mysql.TypeDatetime, charset.CharsetBin},
+		{"from_unixtime(1447430881)", mysql.TypeDatetime, charset.CharsetBin},
+		{"from_unixtime(1447430881, '%Y %D %M %h:%i:%s %x')", mysql.TypeVarString, "utf8"},
 		{"sysdate()", mysql.TypeDatetime, charset.CharsetBin},
 		{"dayname('2007-02-03')", mysql.TypeVarString, "utf8"},
 		{"version()", mysql.TypeVarString, "utf8"},
 		{"database()", mysql.TypeVarString, "utf8"},
+		{"schema()", mysql.TypeVarString, "utf8"},
 		{"user()", mysql.TypeVarString, "utf8"},
 		{"current_user()", mysql.TypeVarString, "utf8"},
 		{"CONCAT('T', 'i', 'DB')", mysql.TypeVarString, "utf8"},
@@ -143,6 +147,7 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		{"hex(12)", mysql.TypeVarString, "utf8"},
 		{"unhex('TiDB')", mysql.TypeVarString, "utf8"},
 		{"unhex(12)", mysql.TypeVarString, "utf8"},
+		{"DATE_FORMAT('2009-10-04 22:23:00', '%W %M %Y')", mysql.TypeVarString, "utf8"},
 	}
 	for _, ca := range cases {
 		ctx := testKit.Se.(context.Context)
@@ -153,7 +158,7 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		is := sessionctx.GetDomain(ctx).InfoSchema()
 		err = plan.ResolveName(stmt, is, ctx)
 		c.Assert(err, IsNil)
-		plan.InferType(stmt)
+		plan.InferType(ctx.GetSessionVars().StmtCtx, stmt)
 		tp := stmt.GetResultFields()[0].Column.Tp
 		chs := stmt.GetResultFields()[0].Column.Charset
 		c.Assert(tp, Equals, ca.tp, Commentf("Tp for %s", ca.expr))
@@ -173,6 +178,7 @@ func (s *testTypeInferrerSuite) TestColumnInfoModified(c *C) {
 	testKit.MustExec("SELECT + - (- CASE + col0 WHEN + CAST( col0 AS SIGNED ) THEN col1 WHEN 79 THEN NULL WHEN + - col1 THEN col0 / + col0 END ) * - 16 FROM tab0")
 	ctx := testKit.Se.(context.Context)
 	is := sessionctx.GetDomain(ctx).InfoSchema()
-	col, _ := is.ColumnByName(model.NewCIStr("test"), model.NewCIStr("tab0"), model.NewCIStr("col1"))
+	tbl, _ := is.TableByName(model.NewCIStr("test"), model.NewCIStr("tab0"))
+	col := table.FindCol(tbl.Cols(), "col1")
 	c.Assert(col.Tp, Equals, mysql.TypeLong)
 }

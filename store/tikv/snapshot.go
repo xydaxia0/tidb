@@ -22,6 +22,7 @@ import (
 	"github.com/ngaut/log"
 	pb "github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/kv"
+	"golang.org/x/net/context"
 )
 
 var (
@@ -56,7 +57,7 @@ func (s *tikvSnapshot) BatchGet(keys []kv.Key) (map[string][]byte, error) {
 
 	// We want [][]byte instead of []kv.Key, use some magic to save memory.
 	bytesKeys := *(*[][]byte)(unsafe.Pointer(&keys))
-	bo := NewBackoffer(batchGetMaxBackoff)
+	bo := NewBackoffer(batchGetMaxBackoff, context.Background())
 
 	// Create a map to collect key-values from region servers.
 	var mu sync.Mutex
@@ -170,7 +171,7 @@ func (s *tikvSnapshot) batchGetSingleRegion(bo *Backoffer, batch batchKeys, coll
 
 // Get gets the value for key k from snapshot.
 func (s *tikvSnapshot) Get(k kv.Key) ([]byte, error) {
-	val, err := s.get(NewBackoffer(getMaxBackoff), k)
+	val, err := s.get(NewBackoffer(getMaxBackoff, context.Background()), k)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -189,11 +190,11 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 		},
 	}
 	for {
-		region, err := s.store.regionCache.GetRegion(bo, k)
+		loc, err := s.store.regionCache.LocateKey(bo, k)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		resp, err := s.store.SendKVReq(bo, req, region.VerID(), readTimeoutShort)
+		resp, err := s.store.SendKVReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -256,12 +257,4 @@ func extractLockFromKeyErr(keyErr *pb.KeyError) (*Lock, error) {
 		return nil, errors.Trace(err)
 	}
 	return nil, errors.Errorf("unexpected KeyError: %s", keyErr.String())
-}
-
-func newLock(l *pb.LockInfo) *Lock {
-	return &Lock{
-		Key:     l.GetKey(),
-		Primary: l.GetPrimaryLock(),
-		TxnID:   l.GetLockVersion(),
-	}
 }

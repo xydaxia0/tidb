@@ -25,7 +25,6 @@ import (
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/types"
@@ -43,9 +42,13 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 	cols := t.Cols()
 	touched := make(map[int]bool, len(cols))
 	assignExists := false
+	sc := ctx.GetSessionVars().StmtCtx
 	var newHandle types.Datum
 	for i, hasSetExpr := range assignFlag {
 		if !hasSetExpr {
+			if onDuplicateUpdate {
+				newData[i] = oldData[i]
+			}
 			continue
 		}
 		if i < offset || i >= offset+len(cols) {
@@ -62,7 +65,7 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 			if newData[i].IsNull() {
 				return errors.Errorf("Column '%v' cannot be null", col.Name.O)
 			}
-			val, err := newData[i].ToInt64()
+			val, err := newData[i].ToInt64(sc)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -94,7 +97,7 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 			continue
 		}
 
-		n, err := newData[i].CompareDatum(oldData[i])
+		n, err := newData[i].CompareDatum(sc, oldData[i])
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -105,8 +108,8 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 	}
 	if !rowChanged {
 		// See https://dev.mysql.com/doc/refman/5.7/en/mysql-real-connect.html  CLIENT_FOUND_ROWS
-		if variable.GetSessionVars(ctx).ClientCapability&mysql.ClientFoundRows > 0 {
-			variable.GetSessionVars(ctx).AddAffectedRows(1)
+		if ctx.GetSessionVars().ClientCapability&mysql.ClientFoundRows > 0 {
+			sc.AddAffectedRows(1)
 		}
 		return nil
 	}
@@ -132,9 +135,9 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 
 	// Record affected rows.
 	if !onDuplicateUpdate {
-		variable.GetSessionVars(ctx).AddAffectedRows(1)
+		sc.AddAffectedRows(1)
 	} else {
-		variable.GetSessionVars(ctx).AddAffectedRows(2)
+		sc.AddAffectedRows(2)
 	}
 	return nil
 }
@@ -151,12 +154,12 @@ type DeleteExec struct {
 	finished bool
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *DeleteExec) Schema() expression.Schema {
 	return nil
 }
 
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *DeleteExec) Next() (*Row, error) {
 	if e.finished {
 		return nil, nil
@@ -170,30 +173,10 @@ func (e *DeleteExec) Next() (*Row, error) {
 
 	tblMap := make(map[int64][]string, len(e.Tables))
 	// Get table alias map.
-	tblNames := make(map[string]string)
 	if e.IsMultiTable {
 		// Delete from multiple tables should consider table ident list.
-		fs := e.SelectExec.Fields()
-		for _, f := range fs {
-			if len(f.TableAsName.L) > 0 {
-				tblNames[f.TableAsName.L] = f.TableName.Name.L
-			} else {
-				tblNames[f.TableName.Name.L] = f.TableName.Name.L
-			}
-		}
-		if len(tblNames) != 0 {
-			for _, t := range e.Tables {
-				// Consider DBName.
-				_, ok := tblNames[t.Name.L]
-				if !ok {
-					return nil, errors.Errorf("Unknown table '%s' in MULTI DELETE", t.Name.O)
-				}
-				tblMap[t.TableInfo.ID] = append(tblMap[t.TableInfo.ID], t.Name.L)
-			}
-		} else { // all columns have been pruned
-			for _, t := range e.Tables {
-				tblMap[t.TableInfo.ID] = append(tblMap[t.TableInfo.ID], t.Name.L)
-			}
+		for _, t := range e.Tables {
+			tblMap[t.TableInfo.ID] = append(tblMap[t.TableInfo.ID], t.Name.L)
 		}
 	}
 
@@ -261,17 +244,11 @@ func (e *DeleteExec) removeRow(ctx context.Context, t table.Table, h int64, data
 		return errors.Trace(err)
 	}
 	getDirtyDB(ctx).deleteRow(t.Meta().ID, h)
-	variable.GetSessionVars(ctx).AddAffectedRows(1)
+	ctx.GetSessionVars().StmtCtx.AddAffectedRows(1)
 	return nil
 }
 
-// Fields implements Executor Fields interface.
-// Returns nil to indicate there is no output.
-func (e *DeleteExec) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *DeleteExec) Close() error {
 	return e.SelectExec.Close()
 }
@@ -435,7 +412,7 @@ func (e *LoadDataInfo) InsertData(prevData, curData []byte) ([]byte, error) {
 		e.insertVal.currRow++
 	}
 	if e.insertVal.lastInsertID != 0 {
-		variable.GetSessionVars(e.insertVal.ctx).LastInsertID = e.insertVal.lastInsertID
+		e.insertVal.ctx.GetSessionVars().SetLastInsertID(e.insertVal.lastInsertID)
 	}
 
 	return curData, nil
@@ -500,6 +477,7 @@ func (e *LoadDataInfo) insertData(cols []string) {
 	row, err := e.insertVal.fillRowData(e.Table.Cols(), e.row, true)
 	if err != nil {
 		log.Warnf("Load Data: insert data:%v failed:%v", e.row, errors.ErrorStack(err))
+		return
 	}
 	_, err = e.Table.AddRecord(e.insertVal.ctx, row)
 	if err != nil {
@@ -524,7 +502,7 @@ func (k loadDataVarKeyType) String() string {
 // LoadDataVarKey is a variable key for load data.
 const LoadDataVarKey loadDataVarKeyType = 0
 
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *LoadData) Next() (*Row, error) {
 	// TODO: support load data without local field.
 	if !e.IsLocal {
@@ -549,18 +527,12 @@ func (e *LoadData) Next() (*Row, error) {
 	return nil, nil
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *LoadData) Schema() expression.Schema {
 	return nil
 }
 
-// Fields implements Executor Fields interface.
-// Returns nil to indicate there is no output.
-func (e *LoadData) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *LoadData) Close() error {
 	return nil
 }
@@ -592,12 +564,12 @@ type InsertExec struct {
 	finished bool
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *InsertExec) Schema() expression.Schema {
 	return nil
 }
 
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *InsertExec) Next() (*Row, error) {
 	if e.finished {
 		return nil, nil
@@ -636,35 +608,33 @@ func (e *InsertExec) Next() (*Row, error) {
 			continue
 		}
 
-		if len(e.OnDuplicate) == 0 || !terror.ErrorEqual(err, kv.ErrKeyExists) {
-			// If you use the IGNORE keyword, errors that occur while executing the INSERT statement are ignored.
+		if terror.ErrorEqual(err, kv.ErrKeyExists) {
+			// If you use the IGNORE keyword, duplicate-key error that occurs while executing the INSERT statement are ignored.
 			// For example, without IGNORE, a row that duplicates an existing UNIQUE index or PRIMARY KEY value in
 			// the table causes a duplicate-key error and the statement is aborted. With IGNORE, the row is discarded and no error occurs.
 			if e.Ignore {
 				continue
 			}
-			return nil, errors.Trace(err)
+			if len(e.OnDuplicate) > 0 {
+				if err = e.onDuplicateUpdate(row, h, toUpdateColumns); err != nil {
+					return nil, errors.Trace(err)
+				}
+				continue
+			}
 		}
-		if err = e.onDuplicateUpdate(row, h, toUpdateColumns); err != nil {
-			return nil, errors.Trace(err)
-		}
+		return nil, errors.Trace(err)
 	}
 
 	if e.lastInsertID != 0 {
-		variable.GetSessionVars(e.ctx).LastInsertID = e.lastInsertID
+		e.ctx.GetSessionVars().SetLastInsertID(e.lastInsertID)
 	}
 	e.finished = true
 	return nil, nil
 }
 
-// Fields implements Executor Fields interface.
-// Returns nil to indicate there is no output.
-func (e *InsertExec) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *InsertExec) Close() error {
+	e.ctx.GetSessionVars().CurrInsertValues = nil
 	if e.SelectExec != nil {
 		return e.SelectExec.Close()
 	}
@@ -756,7 +726,7 @@ func (e *InsertValues) checkValueCount(insertValueCount, valueCount, num int, co
 func (e *InsertValues) getColumnDefaultValues(cols []*table.Column) (map[string]types.Datum, error) {
 	defaultValMap := map[string]types.Datum{}
 	for _, col := range cols {
-		if value, ok, err := table.GetColDefaultValue(e.ctx, &col.ColumnInfo); ok {
+		if value, ok, err := table.GetColDefaultValue(e.ctx, col.ToInfo()); ok {
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -843,21 +813,21 @@ func (e *InsertValues) getRowsSelect(cols []*table.Column) ([][]types.Datum, err
 	return rows, nil
 }
 
-func (e *InsertValues) fillRowData(cols []*table.Column, vals []types.Datum, ignoreCastErr bool) ([]types.Datum, error) {
+func (e *InsertValues) fillRowData(cols []*table.Column, vals []types.Datum, ignoreErr bool) ([]types.Datum, error) {
 	row := make([]types.Datum, len(e.Table.Cols()))
 	marked := make(map[int]struct{}, len(vals))
 	for i, v := range vals {
 		offset := cols[i].Offset
 		row[offset] = v
-		if !ignoreCastErr {
+		if !ignoreErr {
 			marked[offset] = struct{}{}
 		}
 	}
-	err := e.initDefaultValues(row, marked, ignoreCastErr)
+	err := e.initDefaultValues(row, marked, ignoreErr)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	if err = table.CastValues(e.ctx, row, cols, ignoreCastErr); err != nil {
+	if err = table.CastValues(e.ctx, row, cols, ignoreErr); err != nil {
 		return nil, errors.Trace(err)
 	}
 	if err = table.CheckNotNull(e.Table.Cols(), row); err != nil {
@@ -866,13 +836,25 @@ func (e *InsertValues) fillRowData(cols []*table.Column, vals []types.Datum, ign
 	return row, nil
 }
 
+func filterErr(err error, ignoreErr bool) error {
+	if err == nil {
+		return nil
+	}
+	if !ignoreErr {
+		return errors.Trace(err)
+	}
+	log.Warning("ignore err:%v", errors.ErrorStack(err))
+	return nil
+}
+
 func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struct{}, ignoreErr bool) error {
 	var defaultValueCols []*table.Column
+	sc := e.ctx.GetSessionVars().StmtCtx
 	for i, c := range e.Table.Cols() {
 		// It's used for retry.
 		if mysql.HasAutoIncrementFlag(c.Flag) && row[i].IsNull() &&
-			variable.GetSessionVars(e.ctx).RetryInfo.Retrying {
-			id, err := variable.GetSessionVars(e.ctx).RetryInfo.GetCurrAutoIncrementID()
+			e.ctx.GetSessionVars().RetryInfo.Retrying {
+			id, err := e.ctx.GetSessionVars().RetryInfo.GetCurrAutoIncrementID()
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -883,10 +865,11 @@ func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struc
 			if !mysql.HasAutoIncrementFlag(c.Flag) {
 				continue
 			}
-			val, err := row[i].ToInt64()
-			if err != nil && !ignoreErr {
+			val, err := row[i].ToInt64(sc)
+			if filterErr(errors.Trace(err), ignoreErr) != nil {
 				return errors.Trace(err)
 			}
+			row[i].SetInt64(val)
 			if val != 0 {
 				e.Table.RebaseAutoID(val, true)
 				continue
@@ -909,13 +892,13 @@ func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struc
 				e.lastInsertID = uint64(recordID)
 			}
 			// It's used for retry.
-			if !variable.GetSessionVars(e.ctx).RetryInfo.Retrying {
-				variable.GetSessionVars(e.ctx).RetryInfo.AddAutoIncrementID(recordID)
+			if !e.ctx.GetSessionVars().RetryInfo.Retrying {
+				e.ctx.GetSessionVars().RetryInfo.AddAutoIncrementID(recordID)
 			}
 		} else {
 			var err error
-			row[i], _, err = table.GetColDefaultValue(e.ctx, &c.ColumnInfo)
-			if err != nil {
+			row[i], _, err = table.GetColDefaultValue(e.ctx, c.ToInfo())
+			if filterErr(err, ignoreErr) != nil {
 				return errors.Trace(err)
 			}
 		}
@@ -929,20 +912,22 @@ func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struc
 	return nil
 }
 
+// onDuplicateUpdate updates the duplicate row.
+// TODO: Report rows affected and last insert id.
 func (e *InsertExec) onDuplicateUpdate(row []types.Datum, h int64, cols map[int]*ast.Assignment) error {
-	// On duplicate key update the duplicate row.
-	// Evaluate the updated value.
-	// TODO: report rows affected and last insert id.
 	data, err := e.Table.Row(e.ctx, h)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	// For evaluate ValuesExpr
-	// http://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_values
+
+	// for evaluating ColumnNameExpr
 	for i, rf := range e.fields {
-		rf.Expr.SetValue(row[i].GetValue())
+		rf.Expr.SetValue(data[i].GetValue())
 	}
-	// Evaluate assignment
+	// for evaluating ValuesExpr
+	// See http://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_values
+	e.ctx.GetSessionVars().CurrInsertValues = row
+	// evaluate assignment
 	newData := make([]types.Datum, len(data))
 	for i, c := range row {
 		asgn, ok := cols[i]
@@ -956,6 +941,7 @@ func (e *InsertExec) onDuplicateUpdate(row []types.Datum, h int64, cols map[int]
 		}
 		newData[i] = val
 	}
+
 	assignFlag := make([]bool, len(e.Table.Cols()))
 	for i, asgn := range cols {
 		if asgn != nil {
@@ -1003,18 +989,12 @@ type ReplaceExec struct {
 	finished bool
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *ReplaceExec) Schema() expression.Schema {
 	return nil
 }
 
-// Fields implements Executor Fields interface.
-// Returns nil to indicate there is no output.
-func (e *ReplaceExec) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *ReplaceExec) Close() error {
 	if e.SelectExec != nil {
 		return e.SelectExec.Close()
@@ -1022,7 +1002,7 @@ func (e *ReplaceExec) Close() error {
 	return nil
 }
 
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *ReplaceExec) Next() (*Row, error) {
 	if e.finished {
 		return nil, nil
@@ -1056,6 +1036,7 @@ func (e *ReplaceExec) Next() (*Row, error) {
 	 */
 	idx := 0
 	rowsLen := len(rows)
+	sc := e.ctx.GetSessionVars().StmtCtx
 	for {
 		if idx >= rowsLen {
 			break
@@ -1074,13 +1055,13 @@ func (e *ReplaceExec) Next() (*Row, error) {
 		if err1 != nil {
 			return nil, errors.Trace(err1)
 		}
-		rowUnchanged, err1 := types.EqualDatums(oldRow, row)
+		rowUnchanged, err1 := types.EqualDatums(sc, oldRow, row)
 		if err1 != nil {
 			return nil, errors.Trace(err1)
 		}
 		if rowUnchanged {
 			// If row unchanged, we do not need to do insert.
-			variable.GetSessionVars(e.ctx).AddAffectedRows(1)
+			e.ctx.GetSessionVars().StmtCtx.AddAffectedRows(1)
 			idx++
 			continue
 		}
@@ -1090,11 +1071,11 @@ func (e *ReplaceExec) Next() (*Row, error) {
 			return nil, errors.Trace(err1)
 		}
 		getDirtyDB(e.ctx).deleteRow(e.Table.Meta().ID, h)
-		variable.GetSessionVars(e.ctx).AddAffectedRows(1)
+		e.ctx.GetSessionVars().StmtCtx.AddAffectedRows(1)
 	}
 
 	if e.lastInsertID != 0 {
-		variable.GetSessionVars(e.ctx).LastInsertID = e.lastInsertID
+		e.ctx.GetSessionVars().SetLastInsertID(e.lastInsertID)
 	}
 	e.finished = true
 	return nil, nil
@@ -1115,12 +1096,12 @@ type UpdateExec struct {
 	cursor      int
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *UpdateExec) Schema() expression.Schema {
 	return nil
 }
 
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *UpdateExec) Next() (*Row, error) {
 	if !e.fetched {
 		err := e.fetchRows()
@@ -1228,13 +1209,7 @@ func (e *UpdateExec) getTableOffset(entry RowKeyEntry) int {
 	return 0
 }
 
-// Fields implements Executor Fields interface.
-// Returns nil to indicate there is no output.
-func (e *UpdateExec) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *UpdateExec) Close() error {
 	return e.SelectExec.Close()
 }

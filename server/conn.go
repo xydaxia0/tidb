@@ -79,8 +79,8 @@ type clientConn struct {
 
 func (cc *clientConn) String() string {
 	collationStr := mysql.Collations[cc.collation]
-	return fmt.Sprintf("conn: %s, status: %d, collation: %s, user: %s, lastInsertId: %d",
-		cc.conn.RemoteAddr(), cc.ctx.Status(), collationStr, cc.user, cc.ctx.LastInsertID(),
+	return fmt.Sprintf("id:%d, addr:%s status:%d, collation:%s, user:%s",
+		cc.connectionID, cc.conn.RemoteAddr(), cc.ctx.Status(), collationStr, cc.user,
 	)
 }
 
@@ -235,6 +235,10 @@ func handshakeResponseFromData(packet *handshakeResponse41, data []byte) error {
 	}
 
 	if capability&mysql.ClientConnectAtts > 0 {
+		if len(data[pos:]) == 0 {
+			// Defend some ill-formated packet, connection attribute is not important and can be ignored.
+			return nil
+		}
 		if num, null, off := parseLengthEncodedInt(data[pos:]); !null {
 			pos += off
 			kv := data[pos : pos+int(num)]
@@ -335,8 +339,8 @@ func (cc *clientConn) Run() {
 			if terror.ErrorEqual(err, io.EOF) {
 				return
 			}
-			log.Warnf("dispatch error %s, %s", errors.ErrorStack(err), cc)
-			log.Warnf("cmd: %s", string(data[1:]))
+			cmd := string(data[1:])
+			log.Warnf("[%d] dispatch error:\n%s\n%s\n%s", cc.connectionID, cc, cmd, errors.ErrorStack(err))
 			cc.writeError(err)
 		}
 
@@ -369,6 +373,13 @@ func (cc *clientConn) dispatch(data []byte) error {
 	case mysql.ComQuit:
 		return io.EOF
 	case mysql.ComQuery: // Most frequently used command.
+		// For issue 1989
+		// Input payload may end with byte '\0', we didn't find related mysql document about it, but mysql
+		// implementation accept that case. So trim the last '\0' here as if the payload an EOF string.
+		// See http://dev.mysql.com/doc/internals/en/com-query.html
+		if data[len(data)-1] == 0 {
+			data = data[:len(data)-1]
+		}
 		return cc.handleQuery(hack.String(data))
 	case mysql.ComPing:
 		return cc.writeOK()
@@ -398,7 +409,9 @@ func (cc *clientConn) dispatch(data []byte) error {
 }
 
 func (cc *clientConn) useDB(db string) (err error) {
-	_, err = cc.ctx.Execute("use " + db)
+	// if input is "use `SELECT`", mysql client just send "SELECT"
+	// so we add `` around db.
+	_, err = cc.ctx.Execute("use `" + db + "`")
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -554,6 +567,8 @@ func (cc *clientConn) handleLoadData(loadDataInfo *executor.LoadDataInfo) error 
 	return nil
 }
 
+const queryLogMaxLen = 2048
+
 // handleQuery executes the sql query string and writes result set or result ok to the client.
 // As the execution time of this function represents the performance of TiDB, we do time log and metrics here.
 // There is a special query `load data` that does not return result, which is handled differently.
@@ -589,13 +604,13 @@ func (cc *clientConn) handleQuery(sql string) (err error) {
 		err = cc.writeOK()
 	}
 	costTime := time.Since(startTS)
-	if len(sql) > 1024 {
-		sql = sql[:1024]
+	if len(sql) > queryLogMaxLen {
+		sql = sql[:queryLogMaxLen] + fmt.Sprintf("(len:%d)", len(sql))
 	}
 	if costTime < time.Second {
-		log.Debugf("[TIME_QUERY] %v %s", costTime, sql)
+		log.Debugf("[%d][TIME_QUERY] %v\n%s", cc.connectionID, costTime, sql)
 	} else {
-		log.Warnf("[TIME_QUERY] %v %s", costTime, sql)
+		log.Warnf("[%d][TIME_QUERY] %v\n%s", cc.connectionID, costTime, sql)
 	}
 	return errors.Trace(err)
 }

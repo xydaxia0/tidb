@@ -16,10 +16,10 @@ package plan
 import (
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/plan/statistics"
+	"github.com/pingcap/tidb/util/types"
 )
 
 // JoinType contains CrossJoin, InnerJoin, LeftOuterJoin, RightOuterJoin, FullOuterJoin, SemiJoin.
@@ -51,6 +51,27 @@ type Join struct {
 	LeftConditions  []expression.Expression
 	RightConditions []expression.Expression
 	OtherConditions []expression.Expression
+
+	// DefaultValues is only used for outer join, which stands for the default values when the outer table cannot find join partner
+	// instead of null padding.
+	DefaultValues []types.Datum
+}
+
+func (p *Join) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+	for _, fun := range p.EqualConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	for _, fun := range p.LeftConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	for _, fun := range p.RightConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	for _, fun := range p.OtherConditions {
+		corCols = append(corCols, extractCorColumns(fun)...)
+	}
+	return corCols
 }
 
 // Projection represents a select fields plan.
@@ -59,13 +80,36 @@ type Projection struct {
 	Exprs []expression.Expression
 }
 
+func (p *Projection) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+	for _, expr := range p.Exprs {
+		corCols = append(corCols, extractCorColumns(expr)...)
+	}
+	return corCols
+}
+
 // Aggregation represents an aggregate plan.
 type Aggregation struct {
 	baseLogicalPlan
 
 	AggFuncs     []expression.AggregationFunction
 	GroupByItems []expression.Expression
-	ctx          context.Context
+
+	// groupByCols stores the columns that are group-by items.
+	groupByCols []*expression.Column
+}
+
+func (p *Aggregation) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+	for _, expr := range p.GroupByItems {
+		corCols = append(corCols, extractCorColumns(expr)...)
+	}
+	for _, fun := range p.AggFuncs {
+		for _, arg := range fun.GetArgs() {
+			corCols = append(corCols, extractCorColumns(arg)...)
+		}
+	}
+	return corCols
 }
 
 // Selection means a filter.
@@ -81,15 +125,28 @@ type Selection struct {
 	onTable bool
 }
 
+func (p *Selection) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+	for _, cond := range p.Conditions {
+		corCols = append(corCols, extractCorColumns(cond)...)
+	}
+	return corCols
+}
+
 // Apply gets one row from outer executor and gets one row from inner executor according to outer row.
 type Apply struct {
 	baseLogicalPlan
 
-	InnerPlan   LogicalPlan
-	OuterSchema expression.Schema
-	Checker     *ApplyConditionChecker
-	// outerColumns is the columns that not belong to this plan.
-	outerColumns []*expression.Column
+	Checker *ApplyConditionChecker
+	corCols []*expression.CorrelatedColumn
+}
+
+func (p *Apply) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+	if p.Checker != nil {
+		corCols = append(corCols, extractCorColumns(p.Checker.Condition)...)
+	}
+	return corCols
 }
 
 // Exists checks if a query returns result.
@@ -116,7 +173,6 @@ type DataSource struct {
 	Columns []*model.ColumnInfo
 	DBName  *model.CIStr
 	Desc    bool
-	ctx     context.Context
 
 	TableAsName *model.CIStr
 
@@ -125,7 +181,7 @@ type DataSource struct {
 	statisticTable *statistics.Table
 }
 
-// Trim trims child's rows.
+// Trim trims extra columns in src rows.
 type Trim struct {
 	baseLogicalPlan
 }
@@ -141,6 +197,14 @@ type Sort struct {
 
 	ByItems   []*ByItems
 	ExecLimit *Limit
+}
+
+func (p *Sort) extractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+	for _, item := range p.ByItems {
+		corCols = append(corCols, extractCorColumns(item.Expr)...)
+	}
+	return corCols
 }
 
 // Update represents Update plan.

@@ -83,6 +83,11 @@ func initTokenFunc(str string, fn func(s *Scanner) (int, Pos, string)) {
 }
 
 func init() {
+	// invalid is a special token defined in parser.y, when parser meet
+	// this token, it will throw an error.
+	// set root trie node's token to invalid, so when input match nothing
+	// in the trie, invalid will be the default return token.
+	ruleTable.token = invalid
 	initTokenByte('*', int('*'))
 	initTokenByte('/', int('/'))
 	initTokenByte('+', int('+'))
@@ -122,9 +127,10 @@ func init() {
 	initTokenFunc("Xx", startWithXx)
 	initTokenFunc("x", startWithXx)
 	initTokenFunc("b", startWithb)
+	initTokenFunc(".", startWithDot)
 	initTokenFunc("_$ABCDEFGHIJKLMNOPQRSTUVWYZacdefghijklmnopqrstuvwyz", scanIdentifier)
 	initTokenFunc("`", scanQuotedIdent)
-	initTokenFunc("0123456789.", startWithNumber)
+	initTokenFunc("0123456789", startWithNumber)
 	initTokenFunc("'\"", startString)
 }
 
@@ -156,6 +162,7 @@ var tokenMap = map[string]int{
 	"CAST":                cast,
 	"CEIL":                ceil,
 	"CEILING":             ceiling,
+	"CHANGE":              change,
 	"CHARACTER":           character,
 	"CHARSET":             charsetKwd,
 	"CHECK":               check,
@@ -223,6 +230,7 @@ var tokenMap = map[string]int{
 	"ENUM":                enum,
 	"ESCAPE":              escape,
 	"ESCAPED":             escaped,
+	"EVENTS":              events,
 	"EXECUTE":             execute,
 	"EXISTS":              exists,
 	"EXPLAIN":             explain,
@@ -236,6 +244,7 @@ var tokenMap = map[string]int{
 	"FORCE":               force,
 	"FOUND_ROWS":          foundRows,
 	"FROM":                from,
+	"FROM_UNIXTIME":       fromUnixTime,
 	"FULL":                full,
 	"FULLTEXT":            fulltext,
 	"FUNCTION":            function,
@@ -259,6 +268,7 @@ var tokenMap = map[string]int{
 	"IFNULL":              ifNull,
 	"IN":                  in,
 	"INDEX":               index,
+	"INDEXES":             indexes,
 	"INFILE":              infile,
 	"INNER":               inner,
 	"INSERT":              insert,
@@ -275,6 +285,7 @@ var tokenMap = map[string]int{
 	"LEADING":             leading,
 	"LEFT":                left,
 	"LENGTH":              length,
+	"LESS":                less,
 	"LEVEL":               level,
 	"LIKE":                like,
 	"LIMIT":               limit,
@@ -288,6 +299,7 @@ var tokenMap = map[string]int{
 	"LOW_PRIORITY":        lowPriority,
 	"LTRIM":               ltrim,
 	"MAX":                 max,
+	"MAXVALUE":            maxValue,
 	"MAX_ROWS":            maxRows,
 	"MICROSECOND":         microsecond,
 	"MIN":                 min,
@@ -295,6 +307,7 @@ var tokenMap = map[string]int{
 	"MIN_ROWS":            minRows,
 	"MOD":                 mod,
 	"MODE":                mode,
+	"MODIFY":              modify,
 	"MONTH":               month,
 	"MONTHNAME":           monthname,
 	"NAMES":               names,
@@ -317,8 +330,10 @@ var tokenMap = map[string]int{
 	"PRIMARY":             primary,
 	"PRIVILEGES":          privileges,
 	"PROCEDURE":           procedure,
+	"PROCESSLIST":         processlist,
 	"QUARTER":             quarter,
 	"QUICK":               quick,
+	"RANGE":               rangeKwd,
 	"RAND":                rand,
 	"READ":                read,
 	"REDUNDANT":           redundant,
@@ -356,6 +371,7 @@ var tokenMap = map[string]int{
 	"STATUS":              status,
 	"SUBDATE":             subDate,
 	"STRCMP":              strcmp,
+	"STR_TO_DATE":         strToDate,
 	"SUBSTR":              substring,
 	"SUBSTRING":           substring,
 	"SUBSTRING_INDEX":     substringIndex,
@@ -364,6 +380,7 @@ var tokenMap = map[string]int{
 	"TABLE":               tableKwd,
 	"TABLES":              tables,
 	"TERMINATED":          terminated,
+	"THAN":                than,
 	"THEN":                then,
 	"TO":                  to,
 	"TRAILING":            trailing,
@@ -388,6 +405,7 @@ var tokenMap = map[string]int{
 	"VALUES":              values,
 	"VARIABLES":           variables,
 	"VERSION":             version,
+	"VIEW":                view,
 	"WARNINGS":            warnings,
 	"WEEK":                week,
 	"WEEKDAY":             weekday,
@@ -454,6 +472,8 @@ var tokenMap = map[string]int{
 	"CASCADE":             cascade,
 	"NO":                  no,
 	"ACTION":              action,
+	"PARTITION":           partition,
+	"PARTITIONS":          partitions,
 }
 
 func isTokenIdentifier(s string, buf *bytes.Buffer) int {

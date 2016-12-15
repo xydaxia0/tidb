@@ -17,7 +17,6 @@ import (
 	"sort"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
@@ -108,16 +107,12 @@ type UnionScanExec struct {
 	cursor      int
 	sortErr     error
 	snapshotRow *Row
+	schema      expression.Schema
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (us *UnionScanExec) Schema() expression.Schema {
-	return us.Src.Schema()
-}
-
-// Fields implements Executor Fields interface.
-func (us *UnionScanExec) Fields() []*ast.ResultField {
-	return us.Src.Fields()
+	return us.schema
 }
 
 // Next implements Execution Next interface.
@@ -146,9 +141,6 @@ func (us *UnionScanExec) Next() (*Row, error) {
 			us.snapshotRow = nil
 		} else {
 			us.cursor++
-		}
-		for i, field := range us.Src.Fields() {
-			field.Expr.SetDatum(row.Data[i])
 		}
 		return row, nil
 	}
@@ -217,16 +209,17 @@ func (us *UnionScanExec) pickRow(a, b *Row) (*Row, error) {
 	return row, nil
 }
 
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (us *UnionScanExec) Close() error {
 	return us.Src.Close()
 }
 
 func (us *UnionScanExec) compare(a, b *Row) (int, error) {
+	sc := us.ctx.GetSessionVars().StmtCtx
 	for _, colOff := range us.usedIndex {
 		aColumn := a.Data[colOff]
 		bColumn := b.Data[colOff]
-		cmp, err := aColumn.CompareDatum(bColumn)
+		cmp, err := aColumn.CompareDatum(sc, bColumn)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}

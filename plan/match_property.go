@@ -16,22 +16,9 @@ package plan
 import (
 	"math"
 
-	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/util/types"
 )
-
-func tryToAddUnionScan(readOnly bool, conds []expression.Expression, resultPlan PhysicalPlan) PhysicalPlan {
-	if !readOnly {
-		us := &PhysicalUnionScan{
-			Condition: expression.ComposeCNFCondition(conds),
-		}
-		us.SetChildren(resultPlan)
-		us.SetSchema(resultPlan.GetSchema())
-		return us
-	}
-	return resultPlan
-}
 
 // matchProperty implements PhysicalPlan matchProperty interface.
 func (ts *PhysicalTableScan) matchProperty(prop *requiredProperty, infos ...*physicalPlanInfo) *physicalPlanInfo {
@@ -41,38 +28,45 @@ func (ts *PhysicalTableScan) matchProperty(prop *requiredProperty, infos ...*phy
 		cost = float64(prop.limit.Count+prop.limit.Offset) * netWorkFactor
 	}
 	if len(prop.props) == 0 {
-		p := tryToAddUnionScan(ts.readOnly, ts.conditions, ts)
+		newTS := *ts
+		newTS.addLimit(prop.limit)
+		p := newTS.tryToAddUnionScan(&newTS)
 		return enforceProperty(prop, &physicalPlanInfo{p: p, cost: cost, count: infos[0].count})
 	}
-	if len(prop.props) == 1 && ts.pkCol != nil && ts.pkCol == prop.props[0].col {
-		sortedTs := *ts
-		sortedTs.Desc = prop.props[0].desc
-		sortedTs.KeepOrder = true
-		p := tryToAddUnionScan(ts.readOnly, ts.conditions, &sortedTs)
+	if len(prop.props) == 1 && ts.pkCol != nil && ts.pkCol.Equal(prop.props[0].col, ts.ctx) {
+		sortedTS := *ts
+		sortedTS.Desc = prop.props[0].desc
+		sortedTS.KeepOrder = true
+		sortedTS.addLimit(prop.limit)
+		// If there exists a table filter, we should calculate the filter scan cost.
+		if len(sortedTS.tableFilterConditions) > 0 {
+			cost += rowCount * cpuFactor
+		}
+		p := sortedTS.tryToAddUnionScan(&sortedTS)
 		return enforceProperty(&requiredProperty{limit: prop.limit}, &physicalPlanInfo{
 			p:     p,
 			cost:  cost,
 			count: infos[0].count})
 	}
 	if prop.limit != nil {
-		success := ts.addTopN(prop)
+		sortedTS := *ts
+		success := sortedTS.addTopN(ts.ctx, prop)
 		if success {
 			cost += rowCount * cpuFactor
 		} else {
 			cost = rowCount * netWorkFactor
 		}
-		sortedTs := *ts
-		sortedTs.KeepOrder = true
-		p := tryToAddUnionScan(ts.readOnly, ts.conditions, &sortedTs)
+		sortedTS.KeepOrder = true
+		p := sortedTS.tryToAddUnionScan(&sortedTS)
 		return enforceProperty(prop, &physicalPlanInfo{
 			p:     p,
 			cost:  cost,
 			count: infos[0].count})
 	}
-	return &physicalPlanInfo{p: ts, cost: math.MaxFloat64, count: infos[0].count}
+	return &physicalPlanInfo{p: nil, cost: math.MaxFloat64, count: infos[0].count}
 }
 
-func anyMatch(matchedList []bool) bool {
+func allMatch(matchedList []bool) bool {
 	for _, matched := range matchedList {
 		if !matched {
 			return false
@@ -106,12 +100,15 @@ func matchPropColumn(prop *requiredProperty, matchedIdx int, idxCol *model.Index
 // matchProperty implements PhysicalPlan matchProperty interface.
 func (is *PhysicalIndexScan) matchProperty(prop *requiredProperty, infos ...*physicalPlanInfo) *physicalPlanInfo {
 	rowCount := float64(infos[0].count)
+	if prop.limit != nil {
+		rowCount = float64(prop.limit.Count)
+	}
 	cost := rowCount * netWorkFactor
 	if is.DoubleRead {
 		cost *= 2
 	}
 	if len(prop.props) == 0 {
-		p := tryToAddUnionScan(is.readOnly, is.conditions, is)
+		p := is.tryToAddUnionScan(is)
 		return enforceProperty(&requiredProperty{limit: prop.limit}, &physicalPlanInfo{p: p, cost: cost, count: infos[0].count})
 	}
 	matchedIdx := 0
@@ -127,7 +124,7 @@ func (is *PhysicalIndexScan) matchProperty(prop *requiredProperty, infos ...*phy
 			break
 		}
 	}
-	if anyMatch(matchedList) {
+	if allMatch(matchedList) {
 		allDesc, allAsc := true, true
 		for i := 0; i < prop.sortKeyLen; i++ {
 			if prop.props[i].desc {
@@ -138,10 +135,11 @@ func (is *PhysicalIndexScan) matchProperty(prop *requiredProperty, infos ...*phy
 		}
 		sortedCost := cost + rowCount*cpuFactor
 		if allAsc || allDesc {
-			sortedIs := *is
-			sortedIs.OutOfOrder = false
-			sortedIs.Desc = allDesc && !allAsc
-			p := tryToAddUnionScan(is.readOnly, is.conditions, &sortedIs)
+			sortedIS := *is
+			sortedIS.OutOfOrder = false
+			sortedIS.Desc = allDesc && !allAsc
+			sortedIS.addLimit(prop.limit)
+			p := sortedIS.tryToAddUnionScan(&sortedIS)
 			return enforceProperty(&requiredProperty{limit: prop.limit}, &physicalPlanInfo{
 				p:     p,
 				cost:  sortedCost,
@@ -149,21 +147,21 @@ func (is *PhysicalIndexScan) matchProperty(prop *requiredProperty, infos ...*phy
 		}
 	}
 	if prop.limit != nil {
-		success := is.addTopN(prop)
+		sortedIS := *is
+		success := sortedIS.addTopN(is.ctx, prop)
 		if success {
-			cost += rowCount * cpuFactor
+			cost += float64(infos[0].count) * cpuFactor
 		} else {
-			cost = rowCount * netWorkFactor
+			cost = float64(infos[0].count) * netWorkFactor
 		}
-		sortedIs := *is
-		sortedIs.OutOfOrder = true
-		p := tryToAddUnionScan(is.readOnly, is.conditions, &sortedIs)
+		sortedIS.OutOfOrder = true
+		p := sortedIS.tryToAddUnionScan(&sortedIS)
 		return enforceProperty(prop, &physicalPlanInfo{
 			p:     p,
 			cost:  cost,
 			count: infos[0].count})
 	}
-	return &physicalPlanInfo{p: is, cost: math.MaxFloat64, count: infos[0].count}
+	return &physicalPlanInfo{p: nil, cost: math.MaxFloat64, count: infos[0].count}
 }
 
 // matchProperty implements PhysicalPlan matchProperty interface.
@@ -183,7 +181,11 @@ func (p *PhysicalApply) matchProperty(_ *requiredProperty, childPlanInfo ...*phy
 }
 
 func estimateJoinCount(lc uint64, rc uint64) uint64 {
-	return uint64(float64(lc*rc) * joinFactor)
+	count := float64(lc) * float64(rc) * joinFactor
+	if count > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return uint64(count)
 }
 
 // matchProperty implements PhysicalPlan matchProperty interface.
@@ -209,12 +211,14 @@ func (p *Union) matchProperty(_ *requiredProperty, childPlanInfo ...*physicalPla
 	np := *p
 	children := make([]Plan, 0, len(childPlanInfo))
 	cost := float64(0)
+	count := uint64(0)
 	for _, res := range childPlanInfo {
 		children = append(children, res.p)
 		cost += res.cost
+		count += res.count
 	}
 	np.SetChildren(children...)
-	return &physicalPlanInfo{p: &np, cost: cost}
+	return &physicalPlanInfo{p: &np, cost: cost, count: count}
 }
 
 // matchProperty implements PhysicalPlan matchProperty interface.
@@ -251,6 +255,11 @@ func (p *Projection) matchProperty(_ *requiredProperty, childPlanInfo ...*physic
 	np := *p
 	np.SetChildren(childPlanInfo[0].p)
 	return &physicalPlanInfo{p: &np, cost: childPlanInfo[0].cost}
+}
+
+// matchProperty implements PhysicalPlan matchProperty interface.
+func (p *Cache) matchProperty(prop *requiredProperty, childPlanInfo ...*physicalPlanInfo) *physicalPlanInfo {
+	panic("You can't call this function!")
 }
 
 // matchProperty implements PhysicalPlan matchProperty interface.
@@ -315,5 +324,10 @@ func (p *PhysicalDummyScan) matchProperty(_ *requiredProperty, _ ...*physicalPla
 
 // matchProperty implements PhysicalPlan matchProperty interface.
 func (p *Delete) matchProperty(_ *requiredProperty, _ ...*physicalPlanInfo) *physicalPlanInfo {
+	panic("You can't call this function!")
+}
+
+// matchProperty implements PhysicalPlan matchProperty interface.
+func (p *Show) matchProperty(_ *requiredProperty, _ ...*physicalPlanInfo) *physicalPlanInfo {
 	panic("You can't call this function!")
 }

@@ -20,6 +20,8 @@ import (
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/plan"
+	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
@@ -59,7 +61,12 @@ func (m *MockExec) Close() error {
 }
 
 func (s *testSuite) TestAggregation(c *C) {
-	defer testleak.AfterTest(c)()
+	plan.JoinConcurrency = 1
+	defer func() {
+		plan.JoinConcurrency = 5
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
@@ -75,6 +82,8 @@ func (s *testSuite) TestAggregation(c *C) {
 	result.Check(testkit.Rows("3", "2", "2"))
 	result = tk.MustQuery("select count(*) from t having 1 = 0")
 	result.Check(testkit.Rows())
+	result = tk.MustQuery("select c,d from t group by d")
+	result.Check(testkit.Rows("<nil> 1", "1 2", "1 3"))
 	result = tk.MustQuery("select - c, c as d from t group by c having null not between c and avg(distinct d) - d")
 	result.Check(testkit.Rows())
 	result = tk.MustQuery("select - c as c from t group by c having t.c > 5")
@@ -87,11 +96,15 @@ func (s *testSuite) TestAggregation(c *C) {
 	result = tk.MustQuery("select c as a from t group by d having a < 0")
 	result.Check(testkit.Rows())
 	result = tk.MustQuery("select c as a from t group by d having sum(a) = 2")
-	result.Check(testkit.Rows("1"))
+	result.Check(testkit.Rows("<nil>"))
 	result = tk.MustQuery("select count(distinct c) from t group by d")
 	result.Check(testkit.Rows("1", "2", "2"))
 	result = tk.MustQuery("select sum(c) from t group by d")
 	result.Check(testkit.Rows("2", "4", "5"))
+	result = tk.MustQuery("select sum(c), sum(c+1), sum(c), sum(c+1) from t group by d")
+	result.Check(testkit.Rows("2 4 2 4", "4 6 4 6", "5 7 5 7"))
+	result = tk.MustQuery("select count(distinct c,d), count(c,d) from t")
+	result.Check(testkit.Rows("5 6"))
 	result = tk.MustQuery("select d*2 as ee, sum(c) from t group by ee")
 	result.Check(testkit.Rows("2 2", "4 4", "6 5"))
 	result = tk.MustQuery("select sum(distinct c) from t group by d")
@@ -112,12 +125,40 @@ func (s *testSuite) TestAggregation(c *C) {
 	result.Check(testkit.Rows("2", "2"))
 	result = tk.MustQuery("select max(c) from t group by d having sum(c) > 3 order by avg(c) desc")
 	result.Check(testkit.Rows("4", "3"))
+	result = tk.MustQuery("select sum(-1) from t a left outer join t b on not null is null")
+	result.Check(testkit.Rows("-7"))
+	result = tk.MustQuery("select count(*), b.d from t a left join t b on a.c = b.d group by b.d order by b.d")
+	result.Check(testkit.Rows("2 <nil>", "12 1", "2 3"))
+	result = tk.MustQuery("select count(b.d), b.d from t a left join t b on a.c = b.d group by b.d order by b.d")
+	result.Check(testkit.Rows("0 <nil>", "12 1", "2 3"))
+	result = tk.MustQuery("select count(b.d), b.d from t b right join t a on a.c = b.d group by b.d order by b.d")
+	result.Check(testkit.Rows("0 <nil>", "12 1", "2 3"))
+	result = tk.MustQuery("select count(*), b.d from t b right join t a on a.c = b.d group by b.d order by b.d")
+	result.Check(testkit.Rows("2 <nil>", "12 1", "2 3"))
+	result = tk.MustQuery("select max(case when b.d is null then 10 else b.c end), b.d from t b right join t a on a.c = b.d group by b.d order by b.d")
+	result.Check(testkit.Rows("10 <nil>", "1 1", "4 3"))
 	result = tk.MustQuery("select count(*) from t a , t b")
 	result.Check(testkit.Rows("49"))
+	result = tk.MustQuery("select count(*) from t a , t b, t c")
+	result.Check(testkit.Rows("343"))
+	result = tk.MustQuery("select count(*) from t a , t b where a.c = b.d")
+	result.Check(testkit.Rows("14"))
+	result = tk.MustQuery("select count(a.d), sum(b.c) from t a , t b where a.c = b.d")
+	result.Check(testkit.Rows("14 13"))
+	result = tk.MustQuery("select count(*) from t a , t b, t c where a.c = b.d and b.d = c.d")
+	result.Check(testkit.Rows("40"))
+	result = tk.MustQuery("select count(*), a.c from t a , t b, t c where a.c = b.d and b.d = c.d group by c.d order by a.c")
+	result.Check(testkit.Rows("36 1", "4 3"))
+	result = tk.MustQuery("select count(a.c), c.d from t a , t b, t c where a.c = b.d and b.d = c.d group by c.d order by c.d")
+	result.Check(testkit.Rows("36 1", "4 3"))
+	result = tk.MustQuery("select count(*) from t a , t b where a.c = b.d and a.c + b.d = 2")
+	result.Check(testkit.Rows("12"))
 	result = tk.MustQuery("select count(*) from t a join t b having sum(a.c) < 0")
 	result.Check(testkit.Rows())
 	result = tk.MustQuery("select count(*) from t a join t b where a.c < 0")
 	result.Check(testkit.Rows("0"))
+	result = tk.MustQuery("select sum(b.c), count(b.d), a.c from t a left join t b on a.c = b.d group by b.d order by b.d")
+	result.Check(testkit.Rows("<nil> 0 <nil>", "8 12 1", "5 2 3"))
 	// This two cases prove that having always resolve name from field list firstly.
 	result = tk.MustQuery("select 1-d as d from t having d < 0 order by d desc")
 	result.Check(testkit.Rows("-1", "-1", "-2", "-2"))
@@ -219,6 +260,14 @@ func (s *testSuite) TestAggregation(c *C) {
 	tk.MustExec("insert into t (id, ds) values (1, \"1991-09-05\"),(2,\"1991-09-05\"), (3, \"1991-09-06\"),(0,\"1991-09-06\")")
 	result = tk.MustQuery("select sum(id), ds from t group by ds order by id")
 	result.Check(testkit.Rows("3 1991-09-06", "3 1991-09-05"))
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t2")
+	tk.MustExec("create table t1 (col0 int, col1 int)")
+	tk.MustExec("create table t2 (col0 int, col1 int)")
+	tk.MustExec("insert into t1 values(83, 0), (26, 0), (43, 81)")
+	tk.MustExec("insert into t2 values(22, 2), (3, 12), (38, 98)")
+	result = tk.MustQuery("SELECT COALESCE ( + 1, cor0.col0 ) + - CAST( NULL AS DECIMAL ) FROM t2, t1 AS cor0, t2 AS cor1 GROUP BY cor0.col1")
+	result.Check(testkit.Rows("<nil>", "<nil>"))
 }
 
 func (s *testSuite) TestStreamAgg(c *C) {
@@ -279,11 +328,13 @@ func (s *testSuite) TestStreamAgg(c *C) {
 			},
 		},
 	}
+	ctx := mock.NewContext()
 	for _, ca := range cases {
 		mock := &MockExec{}
 		e := &executor.StreamAggExec{
 			AggFuncs: []expression.AggregationFunction{ca.aggFunc},
 			Src:      mock,
+			Ctx:      ctx,
 		}
 		row, err := e.Next()
 		c.Check(err, IsNil)

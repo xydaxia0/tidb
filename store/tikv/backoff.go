@@ -14,12 +14,14 @@
 package tikv
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"time"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -120,6 +122,7 @@ const (
 	cleanupMaxBackoff       = 10000
 	gcMaxBackoff            = 100000
 	gcResolveLockMaxBackoff = 100000
+	rawkvMaxBackoff         = 5000
 )
 
 // Backoffer is a utility for retrying queries.
@@ -128,13 +131,22 @@ type Backoffer struct {
 	maxSleep   int
 	totalSleep int
 	errors     []error
+	ctx        context.Context
 }
 
 // NewBackoffer creates a Backoffer with maximum sleep time(in ms).
-func NewBackoffer(maxSleep int) *Backoffer {
+func NewBackoffer(maxSleep int, ctx context.Context) *Backoffer {
 	return &Backoffer{
 		maxSleep: maxSleep,
+		ctx:      ctx,
 	}
+}
+
+// WithCancel returns a cancel function which, when called, would cancel backoffer's context.
+func (b *Backoffer) WithCancel() context.CancelFunc {
+	var cancel context.CancelFunc
+	b.ctx, cancel = context.WithCancel(b.ctx)
+	return cancel
 }
 
 // Backoff sleeps a while base on the backoffType and records the error message.
@@ -158,8 +170,14 @@ func (b *Backoffer) Backoff(typ backoffType, err error) error {
 	log.Warnf("%v, retry later(totalSleep %dms, maxSleep %dms)", err, b.totalSleep, b.maxSleep)
 	b.errors = append(b.errors, err)
 	if b.totalSleep >= b.maxSleep {
-		e := errors.Errorf("backoffer.maxSleep %dms is exceeded, errors: %v", b.maxSleep, b.errors)
-		return errors.Annotate(e, txnRetryableMark)
+		errMsg := fmt.Sprintf("backoffer.maxSleep %dms is exceeded, errors:", b.maxSleep)
+		for i, err := range b.errors {
+			// Print only last 3 errors for non-DEBUG log levels.
+			if log.GetLogLevel() >= log.LOG_LEVEL_DEBUG || i >= len(b.errors)-3 {
+				errMsg += "\n" + err.Error()
+			}
+		}
+		return errors.Annotate(errors.New(errMsg), txnRetryableMark)
 	}
 	return nil
 }
@@ -170,5 +188,6 @@ func (b *Backoffer) Fork() *Backoffer {
 		maxSleep:   b.maxSleep,
 		totalSleep: b.totalSleep,
 		errors:     b.errors,
+		ctx:        b.ctx,
 	}
 }

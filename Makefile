@@ -24,7 +24,7 @@ LDFLAGS += -X "github.com/pingcap/tidb/util/printer.TiDBGitHash=$(shell git rev-
 
 TARGET = ""
 
-.PHONY: all build update parser clean todo test gotest interpreter server dev benchkv check
+.PHONY: all build update parser clean todo test gotest interpreter server dev benchkv benchraw check
 
 default: server buildsucc
 
@@ -95,18 +95,10 @@ gotest:
 
 race:
 	@export log_level=debug; \
-	dirs=`go list ./... | grep -vE 'vendor' | awk '{sub("github.com/pingcap/tidb/",""); print}'`;\
-	for dir in $$dirs; do \
-		cd $$dir;\
-		$(GOTEST) -race | awk 'END{if($$1=="FAIL") {exit 1}}' || exit 1;\
-		cd -;\
-	done;
+	$(GOTEST) -race $(PACKAGES)
 
 tikv_integration_test:
 	$(GOTEST) ./store/tikv/. -with-tikv=true
-
-interpreter:
-	@cd interpreter && $(GO) build -ldflags '$(LDFLAGS)'
 
 server: parser
 ifeq ($(TARGET), "")
@@ -116,7 +108,13 @@ else
 endif
 
 benchkv:
-	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/benchkv benchkv/main.go
+	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/benchkv cmd/benchkv/main.go
+
+benchraw:
+	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/benchraw cmd/benchraw/main.go
+
+benchdb:
+	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/benchdb cmd/benchdb/main.go
 
 update:
 	which glide >/dev/null || curl https://glide.sh/get | sh

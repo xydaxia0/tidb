@@ -23,18 +23,22 @@ import (
 	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
+	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tipb/go-binlog"
-	"golang.org/x/net/context"
+	goctx "golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -45,7 +49,7 @@ type mockBinlogPump struct {
 	}
 }
 
-func (p *mockBinlogPump) WriteBinlog(ctx context.Context, req *binlog.WriteBinlogReq) (*binlog.WriteBinlogResp, error) {
+func (p *mockBinlogPump) WriteBinlog(ctx goctx.Context, req *binlog.WriteBinlogReq) (*binlog.WriteBinlogResp, error) {
 	p.mu.Lock()
 	p.mu.payloads = append(p.mu.payloads, req.Payload)
 	p.mu.Unlock()
@@ -53,7 +57,7 @@ func (p *mockBinlogPump) WriteBinlog(ctx context.Context, req *binlog.WriteBinlo
 }
 
 // PullBinlogs implements PumpServer interface.
-func (p *mockBinlogPump) PullBinlogs(ctx context.Context, req *binlog.PullBinlogReq) (*binlog.PullBinlogResp, error) {
+func (p *mockBinlogPump) PullBinlogs(ctx goctx.Context, req *binlog.PullBinlogReq) (*binlog.PullBinlogResp, error) {
 	return &binlog.PullBinlogResp{}, nil
 }
 
@@ -64,6 +68,8 @@ type testBinlogSuite struct {
 	unixFile string
 	serv     *grpc.Server
 	pump     *mockBinlogPump
+	tk       *testkit.TestKit
+	ddl      ddl.DDL
 }
 
 func (s *testBinlogSuite) SetUpSuite(c *C) {
@@ -74,6 +80,7 @@ func (s *testBinlogSuite) SetUpSuite(c *C) {
 	s.store = store
 	tidb.SetSchemaLease(0)
 	s.unixFile = "/tmp/mock-binlog-pump"
+	os.Remove(s.unixFile)
 	l, err := net.Listen("unix", s.unixFile)
 	c.Assert(err, IsNil)
 	s.serv = grpc.NewServer()
@@ -87,9 +94,14 @@ func (s *testBinlogSuite) SetUpSuite(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(clientCon, NotNil)
 	binloginfo.PumpClient = binlog.NewPumpClient(clientCon)
+	s.tk = testkit.NewTestKit(c, s.store)
+	s.tk.MustExec("use test")
+	domain := sessionctx.GetDomain(s.tk.Se.(context.Context))
+	s.ddl = domain.DDL()
 }
 
 func (s *testBinlogSuite) TearDownSuite(c *C) {
+	s.ddl.Stop()
 	binloginfo.PumpClient = nil
 	s.serv.Stop()
 	os.Remove(s.unixFile)
@@ -97,13 +109,23 @@ func (s *testBinlogSuite) TearDownSuite(c *C) {
 }
 
 func (s *testBinlogSuite) TestBinlog(c *C) {
-	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec("use test")
+	tk := s.tk
 	pump := s.pump
 	tk.MustExec("drop table if exists local_binlog")
 	ddlQuery := "create table local_binlog (id int primary key, name varchar(10))"
 	tk.MustExec(ddlQuery)
-	c.Assert(getLatestBinlogDDLQuery(c, pump), Equals, ddlQuery)
+	var matched bool // got matched pre DDL and commit DDL
+	for i := 0; i < 10; i++ {
+		preDDL, commitDDL := getLatestDDLBinlog(c, pump, ddlQuery)
+		if preDDL.DdlJobId == commitDDL.DdlJobId {
+			c.Assert(commitDDL.StartTs, Equals, preDDL.StartTs)
+			c.Assert(commitDDL.CommitTs, Greater, commitDDL.StartTs)
+			matched = true
+			break
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	c.Assert(matched, IsTrue)
 
 	tk.MustExec("insert local_binlog values (1, 'abc'), (2, 'cde')")
 	prewriteVal := getLatestBinlogPrewriteValue(c, pump)
@@ -133,6 +155,7 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	tk.MustExec("insert local_binlog2 values ('abc', 16), ('def', 18)")
 	tk.MustExec("delete from local_binlog2 where name = 'def'")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
+	c.Assert(prewriteVal.Mutations[0].Sequence[0], Equals, binlog.MutationType_DeletePK)
 	_, deletedPK, _ := codec.DecodeOne(prewriteVal.Mutations[0].DeletedPks[0])
 	c.Assert(deletedPK.GetString(), Equals, "def")
 
@@ -149,11 +172,27 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 
 	tk.MustExec("delete from local_binlog3 where c1 = 3 and c2 = 3")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
+	c.Assert(prewriteVal.Mutations[0].Sequence[0], Equals, binlog.MutationType_DeleteRow)
 	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].DeletedRows, 1, 3)
 	expected = [][]types.Datum{
 		{types.NewIntDatum(3), types.NewIntDatum(3)},
 	}
 	c.Assert(gotRows, DeepEquals, expected)
+
+	// Test Mutation Sequence.
+	tk.MustExec("create table local_binlog4 (c1 int primary key, c2 int)")
+	tk.MustExec("insert local_binlog4 values (1, 1), (2, 2), (3, 2)")
+	tk.MustExec("begin")
+	tk.MustExec("delete from local_binlog4 where c1 = 1")
+	tk.MustExec("insert local_binlog4 values (1, 1)")
+	tk.MustExec("update local_binlog4 set c2 = 3 where c1 = 3")
+	tk.MustExec("commit")
+	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
+	c.Assert(prewriteVal.Mutations[0].Sequence, DeepEquals, []binlog.MutationType{
+		binlog.MutationType_DeleteID,
+		binlog.MutationType_Insert,
+		binlog.MutationType_Update,
+	})
 
 	checkBinlogCount(c, pump)
 
@@ -186,22 +225,28 @@ func getLatestBinlogPrewriteValue(c *C, pump *mockBinlogPump) *binlog.PrewriteVa
 	return preVal
 }
 
-func getLatestBinlogDDLQuery(c *C, pump *mockBinlogPump) string {
-	var bin *binlog.Binlog
+func getLatestDDLBinlog(c *C, pump *mockBinlogPump, ddlQuery string) (preDDL, commitDDL *binlog.Binlog) {
 	pump.mu.Lock()
 	for i := len(pump.mu.payloads) - 1; i >= 0; i-- {
 		payload := pump.mu.payloads[i]
-		bin = new(binlog.Binlog)
+		bin := new(binlog.Binlog)
 		bin.Unmarshal(payload)
-		if bin.Tp == binlog.BinlogType_PreDDL {
+		if bin.Tp == binlog.BinlogType_Commit && bin.DdlJobId > 0 {
+			commitDDL = bin
+		}
+		if bin.Tp == binlog.BinlogType_Prewrite && bin.DdlJobId != 0 {
+			preDDL = bin
+		}
+		if preDDL != nil && commitDDL != nil {
 			break
 		}
 	}
 	pump.mu.Unlock()
-	c.Assert(bin.DdlJobId, Greater, int64(0))
-	c.Assert(bin.StartTs, Greater, int64(0))
-	c.Assert(bin.CommitTs, Equals, int64(0))
-	return string(bin.DdlQuery)
+	c.Assert(preDDL.DdlJobId, Greater, int64(0))
+	c.Assert(preDDL.StartTs, Greater, int64(0))
+	c.Assert(preDDL.CommitTs, Equals, int64(0))
+	c.Assert(string(preDDL.DdlQuery), Equals, ddlQuery)
+	return
 }
 
 func checkBinlogCount(c *C, pump *mockBinlogPump) {
@@ -215,9 +260,11 @@ func checkBinlogCount(c *C, pump *mockBinlogPump) {
 		bin = new(binlog.Binlog)
 		bin.Unmarshal(payload)
 		if bin.Tp == binlog.BinlogType_Prewrite {
-			prewriteCount++
-		} else if bin.Tp == binlog.BinlogType_PreDDL {
-			ddlCount++
+			if bin.DdlJobId != 0 {
+				ddlCount++
+			} else {
+				prewriteCount++
+			}
 		}
 	}
 	pump.mu.Unlock()

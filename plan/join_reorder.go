@@ -106,7 +106,7 @@ func (e *joinReOrderSolver) reorderJoin(group []LogicalPlan, conds []expression.
 			if f.FuncName.L == ast.EQ {
 				lCol, lok := f.Args[0].(*expression.Column)
 				rCol, rok := f.Args[1].(*expression.Column)
-				if lok && rok && !lCol.Correlated && !rCol.Correlated {
+				if lok && rok {
 					lID := findColumnIndexByGroup(group, lCol)
 					rID := findColumnIndexByGroup(group, rCol)
 					if lID != rID {
@@ -118,7 +118,7 @@ func (e *joinReOrderSolver) reorderJoin(group []LogicalPlan, conds []expression.
 			}
 			id := -1
 			rate := 1.0
-			cols, _ := extractColumn(f, nil, nil)
+			cols := expression.ExtractColumns(f)
 			for _, col := range cols {
 				idx := findColumnIndexByGroup(group, col)
 				if id == -1 {
@@ -186,9 +186,9 @@ func (e *joinReOrderSolver) newJoin(lChild, rChild LogicalPlan) *Join {
 		baseLogicalPlan: newBaseLogicalPlan(Jn, e.allocator),
 	}
 	join.self = join
-	join.initID()
+	join.initIDAndContext(lChild.context())
 	join.SetChildren(lChild, rChild)
-	join.SetSchema(append(lChild.GetSchema().DeepCopy(), rChild.GetSchema().DeepCopy()...))
+	join.SetSchema(append(lChild.GetSchema().Clone(), rChild.GetSchema().Clone()...))
 	lChild.SetParents(join)
 	rChild.SetParents(join)
 	return join
